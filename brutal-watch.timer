@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh TCP Brutal client IP rules every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=brutal-watch.service
+
+[Install]
+WantedBy=timers.target

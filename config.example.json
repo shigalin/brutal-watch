@@ -1,0 +1,8 @@
+{
+  "container": "xboard-node",
+  "ports": [2053],
+  "rate_mbps": 100,
+  "ttl_seconds": 1800,
+  "max_ips": 1024,
+  "exclude_cidrs": []
+}

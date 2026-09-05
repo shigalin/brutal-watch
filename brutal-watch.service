@@ -1,0 +1,14 @@
+[Unit]
+Description=Maintain expiring TCP Brutal client IP rules
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/brutal-watch tick
+User=root
+UMask=0077
+TimeoutStartSec=55s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=brutal-watch

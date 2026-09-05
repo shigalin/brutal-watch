@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+diagnostics/root-*/
+diagnostics/*.cpio.gz
+diagnostics/*.log
+.DS_Store
+.venv/
