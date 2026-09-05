@@ -49,7 +49,7 @@ build_module() {
     --pids-limit=128 --cap-drop=ALL --security-opt=no-new-privileges --read-only \
     --tmpfs /tmp:rw,nosuid,size=64m -v /usr/src:/usr/src:ro -v /lib/modules:/lib/modules:ro \
     -v "$build_dir:$build_dir:rw" -w "$build_dir" "$image" \
-    make -j1 KERNEL_DIR="$headers" CC=gcc all
+    make -j1 KERNEL_DIR="$headers" PWD="$build_dir" CC=gcc all
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then build_module "$@"; fi
