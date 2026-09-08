@@ -85,7 +85,7 @@ def update_compose(raw, name, inherited_godebug=''):
         desired = 'GODEBUG=' + merge_godebug(values[0].split('=', 1)[1] if values else inherited_godebug)
         service['environment'] = [desired if v in values else v for v in current]
         if not values:
-            service['environment'].append(desired)
+            service['environment'].insert(0, desired)
         if env.flow_style:
             updated = raw[:env.start_mark.index] + json.dumps(service['environment']) + raw[env.end_mark.index:]
         elif values:

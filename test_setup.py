@@ -40,6 +40,18 @@ class ComposeTests(unittest.TestCase):
         _, env = self.check(raw)
         self.assertEqual(env, ['TOKEN=${NODE_TOKEN}', 'GODEBUG=netdns=go,multipathtcp=0'])
 
+    def test_list_without_godebug_preserves_existing_entries(self):
+        for environment in (
+            '\n      # keep this comment\n      - TZ=Asia/Shanghai\n      - TOKEN=${NODE_TOKEN}',
+            ' [TZ=Asia/Shanghai, "TOKEN=${NODE_TOKEN}"]',
+        ):
+            with self.subTest(environment=environment):
+                raw = 'services:\n  node:\n    environment:' + environment + '\n'
+                updated, env = self.check(raw, 'netdns=go')
+                self.assertEqual(env, ['GODEBUG=netdns=go,multipathtcp=0', 'TZ=Asia/Shanghai', 'TOKEN=${NODE_TOKEN}'])
+                if '# keep this comment' in raw:
+                    self.assertIn('# keep this comment', updated)
+
     def test_flow_map_and_list(self):
         for env in ('{}', '[]', '{A: example}', '[A=example]'):
             _, result = self.check('services:\n  node:\n    environment: ' + env + '\n')
