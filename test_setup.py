@@ -94,7 +94,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class ConfigureTransactionTests(unittest.TestCase):
-    def run_case(self, changed_image=False, fail_restart=False, unsafe=False):
+    def run_case(self, changed_image=False, fail_restart=False, unsafe=False, relative_path=False):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'compose.yml'
             original = 'services:\n  node:\n    image: example:stable\n'
@@ -106,7 +106,7 @@ class ConfigureTransactionTests(unittest.TestCase):
                     if argv[:2] == ['docker', 'inspect']:
                         return json.dumps([{'Image': 'sha256:old', 'Config': {'Env': [], 'Labels': {
                             'com.docker.compose.service': 'node',
-                            'com.docker.compose.project.config_files': str(path),
+                            'com.docker.compose.project.config_files': path.name if relative_path else str(path),
                             'com.docker.compose.project.working_dir': folder,
                             'com.docker.compose.project': 'existing-project'}}}])
                     if argv[:3] == ['docker', 'compose', 'version']: return '2.30'
@@ -131,7 +131,9 @@ class ConfigureTransactionTests(unittest.TestCase):
             self.assertEqual(len(list(path.parent.glob('*.before-brutal-watch-*'))), 1)
             commands = [a[0] for a in actions if 'up' in a[0]]
             for argv, kwargs in actions:
-                if 'up' in argv or argv[-1] == 'config': self.assertEqual(kwargs['cwd'], folder)
+                if 'up' in argv or argv[-1] == 'config':
+                    self.assertEqual(kwargs['cwd'], folder)
+                    self.assertEqual(argv[argv.index('-f') + 1], str(path))
             return commands
 
     def test_success_uses_same_image_and_only_target_service(self):
@@ -143,6 +145,20 @@ class ConfigureTransactionTests(unittest.TestCase):
 
     def test_changed_image_restores_file_without_restarting(self):
         self.assertEqual(self.run_case(changed_image=True), [])
+
+    def test_relative_compose_path_uses_project_working_directory(self):
+        self.assertEqual(len(self.run_case(relative_path=True)), 1)
+
+    def test_relative_compose_path_without_absolute_working_directory_is_rejected(self):
+        for working_dir in ('', 'relative-project'):
+            obj = [{'Config': {'Labels': {
+                'com.docker.compose.service': 'node',
+                'com.docker.compose.project.config_files': 'compose.yml',
+                'com.docker.compose.project.working_dir': working_dir}}}]
+            with self.subTest(working_dir=working_dir), patch.object(setup.watch.Host, 'run', return_value=json.dumps(obj)) as run:
+                with self.assertRaisesRegex(ValueError, '无法确定现有 Compose 文件'):
+                    setup.configure_node({'container': 'node'})
+                self.assertEqual(run.call_count, 1)
 
     def test_restart_failure_restores_original_configuration(self):
         self.assertEqual(len(self.run_case(fail_restart=True)), 2)

@@ -151,6 +151,9 @@ def configure_node(cfg):
     labels = obj['Config'].get('Labels') or {}
     name = labels.get('com.docker.compose.service')
     paths = [Path(p) for p in labels.get('com.docker.compose.project.config_files', '').split(',') if p]
+    working_dir = labels.get('com.docker.compose.project.working_dir')
+    if working_dir and Path(working_dir).is_absolute():
+        paths = [p if p.is_absolute() else Path(working_dir) / p for p in paths]
     if not name or not paths or any(not p.is_absolute() or not p.is_file() for p in paths):
         raise ValueError('无法确定现有 Compose 文件；请手动设置 GODEBUG=multipathtcp=0 并重建容器')
     candidates = [p for p in paths if name in (yaml.safe_load(p.read_text()).get('services') or {})]
@@ -173,7 +176,7 @@ def configure_node(cfg):
     project = labels.get('com.docker.compose.project')
     if project: command += ['-p', project]
     for path in paths: command += ['-f', str(path)]
-    working_dir = labels.get('com.docker.compose.project.working_dir') or str(paths[0].parent)
+    working_dir = working_dir or str(paths[0].parent)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     backup = target.with_name(target.name + '.before-brutal-watch-' + stamp)
     shutil.copy2(target, backup)
