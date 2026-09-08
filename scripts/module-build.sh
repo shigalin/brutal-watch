@@ -2,14 +2,30 @@
 # DKMS invokes this in its build directory. TCP Brutal sources remain unmodified.
 set -euo pipefail
 
+kernel_config() {
+  local headers=$1 config
+  for config in "$headers/include/config/auto.conf" "$headers/.config"; do
+    if [[ -f "$config" ]]; then
+      printf '%s\n' "$config"
+      return
+    fi
+  done
+  echo '找不到内核 auto.conf 或 .config，无法匹配编译器' >&2
+  return 1
+}
+
 choose_compiler() {
-  local headers=$1 policy=$2 version major candidate actual
-  [[ -f "$headers/.config" ]] || { echo '找不到内核 .config，无法匹配编译器' >&2; return 1; }
-  if grep -q '^CONFIG_CC_IS_CLANG=y' "$headers/.config"; then
-    echo '当前自动安装仅支持 GCC 构建的内核；不会猜测 Clang 工具链或修改内核编译参数' >&2
-    return 1
+  local headers=$1 policy=$2 version major candidate actual config
+  config=$(kernel_config "$headers") || return 1
+  if grep -q '^CONFIG_CC_IS_CLANG=y' "$config"; then
+    [[ "$policy" != docker ]] || { echo 'Clang 内核请使用 --compiler auto 或 native；Docker 编译目前仅支持 GCC' >&2; return 1; }
+    for candidate in clang ld.lld llvm-objcopy; do
+      command -v "$candidate" >/dev/null || { echo "Clang 内核缺少 ${candidate}，请安装 clang、lld、llvm 工具链" >&2; return 1; }
+    done
+    printf 'native:llvm\n'
+    return
   fi
-  version=$(sed -n 's/^CONFIG_GCC_VERSION=\([0-9]*\)$/\1/p' "$headers/.config")
+  version=$(sed -n 's/^CONFIG_GCC_VERSION=\([0-9]*\)$/\1/p' "$config")
   [[ "$version" =~ ^[0-9]+$ && "$version" -ge 50000 ]] || { echo '无法确定内核 GCC 版本' >&2; return 1; }
   major=$((version / 10000))
   if [[ "$policy" != docker ]]; then
@@ -32,6 +48,9 @@ build_module() {
   [[ "$policy" == auto || "$policy" == native || "$policy" == docker ]] || return 2
   headers=$(readlink -f "$headers")
   selected=$(choose_compiler "$headers" "$policy")
+  if [[ "$selected" == native:llvm ]]; then
+    exec make -j2 KERNEL_DIR="$headers" LLVM=1 all
+  fi
   if [[ "$selected" == native:* ]]; then
     compiler=${selected#native:}
     exec make -j2 KERNEL_DIR="$headers" CC="$compiler" all

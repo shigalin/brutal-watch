@@ -26,14 +26,16 @@
 | `brutal-watch.service` / `.timer` | 单次执行及每分钟调度 |
 | `install.sh` | 一键安装、依赖/模块处理，可选节点配置和开启 |
 | `scripts/setup.py` | 配置保留、Compose 编辑/回滚和监听验证 |
-| `scripts/module-build.sh` | 标准 DKMS 构建入口，自动匹配 GCC |
+| `scripts/module-build.sh` | 标准 DKMS 构建入口，匹配 GCC 或使用 LLVM 工具链 |
 | `test_brutal_watch.py` | 模拟主机操作的回归测试，不操作网络 |
 
 ## 安装和命令
 
 安装命令和平台要求见 [README](README.md)。默认安装会自动补齐缺少的依赖、验证普通 TCP 监听、安装或复用官方 v2 模块；不自动改变节点配置或开启加速。`--configure-node` 和 `--enable` 分别明确授权这两项操作。
 
-DKMS 包名是 `tcp-brutal`，实际内核模块名是 `brutal`。新安装的源码及 DKMS 构建配置保存在 `/usr/src/tcp-brutal-2.0.0-bw377d2a0`、`/etc/dkms/tcp-brutal-2.0.0-bw377d2a0.conf`，构建入口为 `/usr/local/libexec/brutal-watch/module-build`。复用既有手工模块时不会自动转换其安装方式。
+DKMS 包名是 `tcp-brutal`，实际内核模块名是 `brutal`。新安装的源码及 DKMS 构建配置保存在 `/usr/src/tcp-brutal-2.0.0-bw644db52`、`/etc/dkms/tcp-brutal-2.0.0-bw644db52.conf`，构建入口为 `/usr/local/libexec/brutal-watch/module-build`。复用既有模块时不会自动升级到上述版本，手工安装也不会自动转换为 DKMS；实际版本及路径以本机安装记录为准。
+
+编译入口优先读取 headers 的 `include/config/auto.conf`，不存在时使用 `.config`，与上游 Makefile 的配置选择顺序一致。GCC 内核沿用匹配本机 GCC、必要时使用 GCC 容器的流程。Clang 内核在 `--compiler auto` / `native` 下由安装器补齐 `clang`、`lld`、`llvm`，通过上游 `LLVM=1` 机制构建，不传入 GCC 的 `CC=` 覆盖；显式选择 `--compiler docker` 会拒绝，因为现有容器编译路径仅支持 GCC。定制内核若要求其他 LLVM 版本，需准备兼容工具链；后续 DKMS 重建也要求工具链可用。
 
 ```text
 brutal-watch check   # 只读检查模块接口、实际 TCP 协议、容器、端口、策略路由及状态文件
@@ -87,7 +89,8 @@ bash -n install.sh scripts/module-build.sh
 
 ## 上游依据
 
-- [TCP Brutal v2 README（核对版本 377d2a0）](https://github.com/HyNetworks/tcp-brutal/blob/377d2a0e9324ef585ff90ea91779baf276cf6a50/README.md)
-- [规则接口与删除生命周期](https://github.com/HyNetworks/tcp-brutal/blob/377d2a0e9324ef585ff90ea91779baf276cf6a50/brutal_rules.c)
-- [brutalctl 的路由管理实现](https://github.com/HyNetworks/tcp-brutal/blob/377d2a0e9324ef585ff90ea91779baf276cf6a50/tools/brutalctl.c)
+- [TCP Brutal v2 README（核对版本 644db52）](https://github.com/HyNetworks/tcp-brutal/blob/644db5226173dba741fe2b593082702fa7b16108/README.md)
+- [Clang 内核构建支持](https://github.com/HyNetworks/tcp-brutal/commit/b885a05541f99d9f741a92f5b38a1418fce7fa10)
+- [规则接口与删除生命周期](https://github.com/HyNetworks/tcp-brutal/blob/644db5226173dba741fe2b593082702fa7b16108/brutal_rules.c)
+- [brutalctl 的路由管理实现](https://github.com/HyNetworks/tcp-brutal/blob/644db5226173dba741fe2b593082702fa7b16108/tools/brutalctl.c)
 - [iproute2 路由输出实现](https://github.com/iproute2/iproute2/blob/main/ip/iproute.c)

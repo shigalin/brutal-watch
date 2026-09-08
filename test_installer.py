@@ -77,6 +77,46 @@ main %s
 
 
 class CompilerTests(unittest.TestCase):
+    def clang_build(self, policy='auto', missing='', auto_conf=False):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            config = path / ('include/config/auto.conf' if auto_conf else '.config')
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text('CONFIG_CC_IS_CLANG=y\n')
+            if auto_conf:
+                (path / '.config').write_text('CONFIG_GCC_VERSION=130200\n')
+            binary = path / 'bin'
+            binary.mkdir()
+            make = binary / 'make'
+            make.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+            make.chmod(0o755)
+            script = '''source "$1/scripts/module-build.sh"
+command() { [[ "$1" == -v && "$2" != "$4" ]]; }
+build_module "$3" "$2"
+'''.replace('"$2" != "$4"', '"$2" != ' + shlex.quote(missing))
+            env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'])
+            return subprocess.run(['bash', '-c', script, 'test', str(ROOT), str(path), policy], env=env, capture_output=True, text=True)
+
+    def test_clang_build_uses_llvm_without_gcc_override(self):
+        for policy in ('auto', 'native'):
+            for auto_conf in (False, True):
+                with self.subTest(policy=policy, auto_conf=auto_conf):
+                    result = self.clang_build(policy, auto_conf=auto_conf)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('LLVM=1', result.stdout.splitlines())
+                    self.assertFalse(any(arg.startswith('CC=') for arg in result.stdout.splitlines()))
+
+    def test_clang_build_requires_tools(self):
+        for tool in ('clang', 'ld.lld', 'llvm-objcopy'):
+            result = self.clang_build(missing=tool)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(tool, result.stderr)
+
+    def test_clang_docker_policy_is_not_silently_changed(self):
+        result = self.clang_build('docker')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--compiler auto', result.stderr)
+
     def select(self, policy, kernel_version=130200, host_version='10.2.1'):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)

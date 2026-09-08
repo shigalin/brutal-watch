@@ -3,9 +3,9 @@
 set -Eeuo pipefail
 PROJECT_REPO=shigalin/brutal-watch
 PROJECT_REF=${BRUTAL_WATCH_REF:-main}
-UPSTREAM_COMMIT=377d2a0e9324ef585ff90ea91779baf276cf6a50
-UPSTREAM_SHA256=c99bb2ce1bbe11c2884112ad64fd05e27063a508e2644c407f2bb7f47c381728
-DKMS_VERSION=2.0.0-bw377d2a0
+UPSTREAM_COMMIT=644db5226173dba741fe2b593082702fa7b16108
+UPSTREAM_SHA256=8e37baa6ac7844c618005e90f6a204fb858865f25988a62de0d9a21cdfa08be6
+DKMS_VERSION=2.0.0-bw644db52
 MODULE_NAME=tcp-brutal
 LIBEXEC=/usr/local/libexec/brutal-watch
 CONFIGURE_NODE=0
@@ -134,7 +134,7 @@ project_source() {
 }
 
 install_module() {
-  local kernel source headers override
+  local kernel source headers override config
   kernel=$(uname -r)
   if [[ -e /proc/net/tcp_brutal/rules ]]; then
     echo '复用已加载的 v2 模块；保留原有安装方式和升级策略'
@@ -160,7 +160,13 @@ install_module() {
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends "linux-headers-$kernel" \
       || die "无法取得 $kernel 的 headers；定制内核需要其提供方的匹配 headers，不会替换内核"
   fi
-  [[ -f "$headers/Makefile" && -f "$headers/.config" ]] || die '内核 headers 不完整'
+  [[ -f "$headers/Makefile" ]] || die '内核 headers 不完整'
+  source "$SOURCE_DIR/scripts/module-build.sh"
+  config=$(kernel_config "$headers") || die '内核 headers 不完整'
+  if grep -q '^CONFIG_CC_IS_CLANG=y' "$config"; then
+    [[ "$COMPILER" != docker ]] || die 'Clang 内核请使用 --compiler auto 或 native；Docker 编译目前仅支持 GCC'
+    install_packages clang lld llvm
+  fi
   source="/usr/src/$MODULE_NAME-$DKMS_VERSION"
   if [[ ! -d "$source" ]]; then
     curl -fL --connect-timeout 15 --max-time 120 --retry 2 \

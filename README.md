@@ -203,6 +203,7 @@ brutal-watch on
 | 问题 | 处理方式 |
 | --- | --- |
 | 宿主机 GCC 10、内核由 GCC 13 编译 | 读取内核配置，优先用匹配 GCC；没有则用官方 GCC 容器编译，不取消内核安全编译选项 |
+| Clang 构建的内核 | `auto` / `native` 安装本机 clang、lld、llvm，沿用上游 `LLVM=1` 构建；`docker` 目前仅支持 GCC |
 | 定制内核缺 headers | 查找当前内核对应包；取得失败则停止，不擅自换内核或重启服务器 |
 | MPTCP 与 Brutal 冲突 | 使用 Go 官方 `GODEBUG=multipathtcp=0`；开启前直接读取真实监听 socket 的 `SO_PROTOCOL`，要求普通 TCP（6） |
 | `tcp_multi_path=false` 仍使用 MPTCP | 不依赖布尔配置猜测；若程序显式开启 MPTCP、环境变量不起作用，拒绝开启并回滚自动调整 |
@@ -216,7 +217,7 @@ brutal-watch on
 
 **复用此前手工安装的 v2 模块不会自动将其转换为 DKMS 安装**，原来的内核升级维护方式仍适用。
 
-自动编译目前支持 GCC 构建的内核；Clang 内核需要手动准备匹配模块。受限环境若禁止 root 通过 `pidfd_getfd` 检查目标进程 socket，会拒绝开启，不降低协议验证要求。
+自动编译支持 GCC 和 Clang 构建的内核。Clang 使用发行版提供的 LLVM 工具链；若定制内核要求其他工具链版本，仍需自行准备兼容版本。DKMS 后续重建也需要对应工具链可用。受限环境若禁止 root 通过 `pidfd_getfd` 检查目标进程 socket，会拒绝开启，不降低协议验证要求。
 
 ## 使用边界
 
