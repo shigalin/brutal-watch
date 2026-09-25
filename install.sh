@@ -14,6 +14,7 @@ SKIP_MODULE=0
 COMPILER=auto
 TMP_WORK=
 CONFIG_ARGS=()
+PACKAGE_INDEX_UPDATED=0
 
 usage() {
   cat <<'EOF'
@@ -71,10 +72,44 @@ check_platform() {
   . /etc/os-release
   [[ ${ID:-} == debian || ${ID:-} == ubuntu ]] || die '当前一键依赖安装仅支持 Debian/Ubuntu'
   [[ -d /run/systemd/system ]] || die '需要宿主机 systemd；不要在普通 Docker 容器内运行安装器'
-  command -v docker >/dev/null || die '请先部署需要加速的 Docker 节点；本安装器不会安装或替换节点'
-  docker info >/dev/null 2>&1 || die 'Docker 未运行'
   if systemctl is-active --quiet brutal-watch.timer || systemctl is-active --quiet brutal-watch.service; then
     die 'brutal-watch 仍在运行，请先 off；更新不会擅自停止节点或覆盖运行中的工具'
+  fi
+}
+
+check_docker() {
+  if ! command -v docker >/dev/null; then
+    if package_installed docker-cli; then
+      die 'docker-cli 已安装，但找不到 docker 命令；请检查 PATH 或修复 docker-cli 软件包'
+    fi
+    package_installed docker.io \
+      || die '未找到 Docker 客户端，也未检测到已安装的 docker.io 服务端；请检查现有 Docker 安装，本安装器不会安装或替换服务端或节点'
+    local files
+    files=$(dpkg-query -L docker.io) || die '无法读取 docker.io 文件清单，请检查软件包状态'
+    if grep -Eq '^/(usr/)?bin/docker$' <<< "$files"; then
+      die '当前 docker.io 已包含客户端，但找不到 docker 命令；请检查 PATH 或修复原软件包，不会自动重装服务端'
+    fi
+    systemctl is-active --quiet docker || systemctl is-active --quiet docker.socket \
+      || die 'Docker 未运行，docker.socket 也未激活；请先检查已有 Docker 服务'
+    update_package_index
+    LC_ALL=C apt-cache policy docker-cli 2>/dev/null \
+      | awk '$1 == "Candidate:" && $2 != "(none)" {found=1} END {exit !found}' \
+      || die '当前软件源没有可安装的 docker-cli，请检查客户端包来源；不会安装或替换 Docker 服务端'
+    echo '检测到已有 docker.io 服务端但缺少 Docker 客户端，补装 docker-cli'
+    install_packages docker-cli
+    command -v docker >/dev/null || die '补装后仍找不到 Docker 客户端，请检查 docker-cli 包和 PATH'
+  fi
+  docker info >/dev/null 2>&1 || die '无法连接 Docker 服务，请检查服务状态和 Docker 客户端连接配置'
+}
+
+package_installed() {
+  dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -qx installed
+}
+
+update_package_index() {
+  if [[ "$PACKAGE_INDEX_UPDATED" == 0 ]]; then
+    apt-get update || die '软件源索引更新失败，请检查上面的 apt 错误后重试'
+    PACKAGE_INDEX_UPDATED=1
   fi
 }
 
@@ -82,11 +117,12 @@ install_packages() {
   local wanted=("$@")
   local missing=() pkg
   for pkg in "${wanted[@]}"; do
-    dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed || missing+=("$pkg")
+    package_installed "$pkg" || missing+=("$pkg")
   done
   if ((${#missing[@]})); then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends "${missing[@]}"
+    update_package_index
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends "${missing[@]}" \
+      || die "${missing[*]} 安装失败，请检查上面的 apt 错误后重试"
   fi
 }
 
@@ -157,6 +193,7 @@ install_module() {
   install_packages dkms gcc make libc6-dev
   headers="/lib/modules/$kernel/build"
   if [[ ! -f "$headers/Makefile" ]]; then
+    update_package_index
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends "linux-headers-$kernel" \
       || die "无法取得 $kernel 的 headers；定制内核需要其提供方的匹配 headers，不会替换内核"
   fi
@@ -228,6 +265,7 @@ main() {
   trap cleanup EXIT
   umask 077
   TMP_WORK=$(mktemp -d /tmp/brutal-watch-install.XXXXXXXX)
+  check_docker
   install_dependencies
   project_source
   python3 "$SOURCE_DIR/scripts/setup.py" idle

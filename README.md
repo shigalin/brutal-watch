@@ -11,6 +11,8 @@
 
 适用于 **Debian/Ubuntu、Linux >=5.10、x86_64/aarch64、systemd，以及已经运行的 Docker host 网络节点**。以 root 执行，端口替换成自己的节点端口。
 
+缺少 `docker` 命令时，只有已安装的 `docker.io` 不包含客户端、Docker 服务或 `docker.socket` 已激活，且软件源提供 `docker-cli` 候选版本，安装器才会自动补装客户端，再继续检查现有节点。这适用于 Debian 13 的拆包情况；若 `docker.io` 本身包含客户端（如 Debian 12、Ubuntu 24.04），会提示检查 PATH 或修复原软件包。不会自动安装或替换 Docker 服务端或部署节点。
+
 下面的命令会安装依赖和官方模块，备份并调整目标节点 Compose 的 `GODEBUG`，重建该容器一次，然后开启加速及开机自启。**重建容器会短暂断开连接。**
 
 ```bash

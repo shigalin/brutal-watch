@@ -14,6 +14,7 @@ class InstallerTests(unittest.TestCase):
         script = '''
 source "$1/install.sh"
 check_platform() { echo platform; }
+check_docker() { echo docker; }
 acquire_locks() { echo locked; }
 release_runtime_lock() { echo unlocked; }
 install_dependencies() { echo dependencies; }
@@ -32,6 +33,8 @@ main %s
         self.assertIn('verify-node', result.stdout)
         self.assertNotIn('configure-node', result.stdout)
         self.assertNotIn('watch:on', result.stdout)
+        self.assertLess(result.stdout.index('locked'), result.stdout.index('\ndocker'))
+        self.assertLess(result.stdout.index('\ndocker'), result.stdout.index('dependencies'))
         self.assertLess(result.stdout.index('unlocked'), result.stdout.index('watch:check'))
 
     def test_explicit_configuration_and_enable_order(self):
@@ -57,6 +60,26 @@ main %s
         self.assertEqual(result.returncode, 0)
         self.assertIn('--configure-node', result.stdout)
 
+    def test_missing_headers_refresh_index_when_other_packages_are_installed(self):
+        if Path('/proc/net/tcp_brutal/rules').exists():
+            self.skipTest('Loaded Brutal module bypasses header installation')
+        # Stop at the simulated headers install; never build or load a module.
+        script = '''
+source "$1/install.sh"
+uname() { echo brutal-watch-test-missing-headers; }
+modinfo() { return 1; }
+dpkg-query() { echo installed; }
+apt-get() { echo "apt:$*"; [[ "$1" == update ]]; }
+install_module
+'''
+        result = subprocess.run(['bash', '-c', script, 'test', str(ROOT)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('无法取得 brutal-watch-test-missing-headers 的 headers', result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            'apt:update',
+            'apt:install -y --no-install-recommends linux-headers-brutal-watch-test-missing-headers',
+        ])
+
     def test_archive_rejects_traversal_and_symlinks(self):
         import tarfile, io
         with tempfile.TemporaryDirectory() as folder:
@@ -74,6 +97,130 @@ main %s
                 result = subprocess.run(['bash', '-c', command, 'test', str(ROOT), str(archive), str(out)], capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((root / 'escaped').exists())
+
+
+class DockerClientTests(unittest.TestCase):
+    def check(self, client=False, server=True, active=True, install_ok=True, reachable=True,
+              candidate=True, bundled=False, socket_active=False, update_ok=True, extra_dependency=False,
+              cli_installed=False):
+        # Mock host commands only; exercise the real client check and package installer.
+        script = '''
+source "$1/install.sh"
+client=$2; server=$3; active=$4; install_ok=$5; reachable=$6
+candidate=$7; bundled=$8; socket_active=$9; update_ok=${10}; extra_dependency=${11}
+cli_installed=${12}
+command() {
+  if [[ "$*" == "-v docker" ]]; then [[ "$client" == 1 ]]; else builtin command "$@"; fi
+}
+dpkg-query() {
+  if [[ "${@: -1}" == docker-cli && "$cli_installed" == 1 ]]; then echo installed; return; fi
+  [[ "${@: -1}" == docker.io && "$server" == 1 ]] || return 1
+  if [[ "$1" == -L ]]; then
+    if [[ "$bundled" == 1 ]]; then echo /usr/bin/docker; fi
+    return 0
+  fi
+  echo installed
+}
+systemctl() {
+  [[ "$*" == "is-active --quiet docker" && "$active" == 1 ]] ||
+    [[ "$*" == "is-active --quiet docker.socket" && "$socket_active" == 1 ]]
+}
+apt-cache() {
+  [[ "$*" == "policy docker-cli" ]] || return 1
+  if [[ "$candidate" == 1 ]]; then echo '  Candidate: 26.1.5'; else echo '  Candidate: (none)'; fi
+}
+apt-get() {
+  echo "apt:$*"
+  if [[ "$1" == update ]]; then [[ "$update_ok" == 1 ]] || return 1; fi
+  if [[ "$1" == install ]]; then
+    [[ "$install_ok" == 1 ]] || return 1
+    client=1
+  fi
+}
+docker() { [[ "$*" == info && "$reachable" == 1 ]]; }
+check_docker
+if [[ "$extra_dependency" == 1 ]]; then install_packages python3; fi
+echo checked
+'''
+        args = [str(int(value)) for value in (client, server, active, install_ok, reachable,
+                                             candidate, bundled, socket_active, update_ok, extra_dependency,
+                                             cli_installed)]
+        return subprocess.run(['bash', '-c', script, 'test', str(ROOT), *args], capture_output=True, text=True)
+
+    def test_split_package_installs_only_client(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([line for line in result.stdout.splitlines() if line.startswith('apt:')],
+                         ['apt:update', 'apt:install -y --no-install-recommends docker-cli'])
+        self.assertIn('checked', result.stdout)
+
+    def test_existing_client_needs_no_install(self):
+        result = self.check(client=True, server=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('apt:', result.stdout)
+
+    def test_installed_but_invisible_client_stops_before_package_operations(self):
+        result = self.check(cli_installed=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('docker-cli 已安装', result.stderr)
+        self.assertIn('PATH', result.stderr)
+        self.assertNotIn('apt:', result.stdout)
+        self.assertNotIn('补装', result.stdout + result.stderr)
+
+    def test_missing_server_does_not_install(self):
+        result = self.check(server=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('服务端', result.stderr)
+        self.assertNotIn('apt:', result.stdout)
+
+    def test_inactive_server_does_not_install(self):
+        result = self.check(active=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Docker 未运行', result.stderr)
+        self.assertNotIn('apt:', result.stdout)
+
+    def test_failed_client_install_stops(self):
+        result = self.check(install_ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('docker-cli 安装失败', result.stderr)
+        self.assertNotIn('checked', result.stdout)
+
+    def test_bundled_client_is_not_treated_as_split_package(self):
+        result = self.check(bundled=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('docker.io 已包含客户端', result.stderr)
+        self.assertNotIn('apt:', result.stdout)
+
+    def test_missing_candidate_has_actionable_error_without_install(self):
+        result = self.check(candidate=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('没有可安装的 docker-cli', result.stderr)
+        self.assertNotIn('apt:install', result.stdout)
+
+    def test_active_socket_allows_client_install(self):
+        result = self.check(active=False, socket_active=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('apt:install -y --no-install-recommends docker-cli', result.stdout)
+
+    def test_failed_index_update_stops_before_install(self):
+        result = self.check(update_ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('软件源索引更新失败', result.stderr)
+        self.assertNotIn('apt:install', result.stdout)
+
+    def test_client_and_dependencies_share_one_index_update(self):
+        result = self.check(extra_dependency=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines().count('apt:update'), 1)
+        self.assertIn('apt:install -y --no-install-recommends python3', result.stdout)
+
+    def test_unreachable_daemon_stops_with_or_without_existing_client(self):
+        for client in (False, True):
+            with self.subTest(client=client):
+                result = self.check(client=client, reachable=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('无法连接 Docker', result.stderr)
+                self.assertNotIn('checked', result.stdout)
 
 
 class CompilerTests(unittest.TestCase):
