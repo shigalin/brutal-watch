@@ -42,6 +42,13 @@ def short_error(error):
     return str(error).replace('\n', ' ')[:300]
 
 
+def configure_output():
+    # Chinese CLI messages must not fail under a non-UTF-8 host environment.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+
+
 def config_load(path):
     return validate_config(json.loads(path.read_text()))
 
@@ -645,6 +652,7 @@ def exclusive_lock(path):
 
 
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description='独立 TCP Brutal v2 IP 规则管理；不修改节点部署')
     parser.add_argument('command', choices=('check', 'on', 'off', 'status', 'tick'))
     args = parser.parse_args()

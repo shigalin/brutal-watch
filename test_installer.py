@@ -19,12 +19,14 @@ acquire_locks() { echo locked; }
 release_runtime_lock() { echo unlocked; }
 install_dependencies() { echo dependencies; }
 project_source() { SOURCE_DIR=/mock-source; }
+prepare_module() { echo prepare; %s; }
 install_tool() { echo tool; }
 install_module() { echo module; %s; }
 python3() { echo "python:$*"; if [[ "$*" == *verify-node* ]]; then %s; fi; }
 brutal-watch() { echo "watch:$*"; }
 main %s
-''' % ('return 1' if fail == 'module' else ':', 'return 1' if fail == 'verify' else ':', args)
+''' % ('return 1' if fail == 'prepare' else ':', 'return 1' if fail == 'module' else ':',
+       'return 1' if fail == 'verify' else ':', args)
         return subprocess.run(['bash', '-c', script, 'test', str(ROOT)], capture_output=True, text=True)
 
     def test_default_does_not_reconfigure_or_enable(self):
@@ -33,6 +35,7 @@ main %s
         self.assertIn('verify-node', result.stdout)
         self.assertNotIn('configure-node', result.stdout)
         self.assertNotIn('watch:on', result.stdout)
+        self.assertLess(result.stdout.index('verify-node'), result.stdout.index('prepare'))
         self.assertLess(result.stdout.index('locked'), result.stdout.index('\ndocker'))
         self.assertLess(result.stdout.index('\ndocker'), result.stdout.index('dependencies'))
         self.assertLess(result.stdout.index('unlocked'), result.stdout.index('watch:check'))
@@ -41,14 +44,50 @@ main %s
         result = self.flow('--configure-node --enable --ports 443')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('config --ports 443', result.stdout)
+        self.assertLess(result.stdout.index('prepare'), result.stdout.index('configure-node'))
         self.assertLess(result.stdout.index('configure-node'), result.stdout.index('\nmodule'))
         self.assertLess(result.stdout.index('watch:check'), result.stdout.index('watch:on'))
 
     def test_failed_node_validation_never_loads_module(self):
         result = self.flow('--enable', 'verify')
         self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('prepare', result.stdout)
+        self.assertNotIn('\ntool', result.stdout)
         self.assertNotIn('\nmodule', result.stdout)
         self.assertNotIn('watch:on', result.stdout)
+
+    def test_failed_preparation_never_changes_node_or_installed_tool(self):
+        result = self.flow('--configure-node --enable', 'prepare')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('configure-node', result.stdout)
+        self.assertNotIn('\ntool', result.stdout)
+        self.assertNotIn('\nmodule', result.stdout)
+
+    def test_existing_v2_or_skip_module_needs_no_build_preparation(self):
+        for skip in (False, True):
+            script = '''source "$1/install.sh"
+SKIP_MODULE=$2
+modinfo() { echo 2.0.0; }
+install_packages() { echo unexpected-package-install; return 1; }
+modprobe() { echo unexpected-module-load; return 1; }
+prepare_module
+'''
+            result = subprocess.run(['bash', '-c', script, 'test', str(ROOT), str(int(skip))], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, '')
+
+    def test_prepare_and_install_share_module_mode_and_propagate_failure(self):
+        for operation in ('prepare_module', 'install_module'):
+            script = '''source "$1/install.sh"
+module_mode() { echo mode-failed >&2; return 1; }
+install_packages() { echo unexpected-packages; }
+modprobe() { echo unexpected-load; }
+"$2"
+'''
+            result = subprocess.run(['bash', '-c', script, 'test', str(ROOT), operation], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('mode-failed', result.stderr)
+            self.assertEqual(result.stdout, '')
 
     def test_failed_module_install_never_enables(self):
         result = self.flow('--enable', 'module')
@@ -60,21 +99,43 @@ main %s
         self.assertEqual(result.returncode, 0)
         self.assertIn('--configure-node', result.stdout)
 
+    def test_archive_wait_flag_is_forwarded_only_to_archive_helper(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = '''source "$1/install.sh"
+parse_args --archive-wait-minutes 30
+ID=debian; SOURCE_DIR=/mock-source; TMP_WORK=/mock-work
+update_package_index() { :; }
+apt-cache() { echo 'Candidate: (none)'; }
+python3() { printf '%s\\n' "$*"; }
+printf 'config:%s\\n' ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"}
+ensure_headers mock-kernel "$2"
+'''
+            result = subprocess.run(['bash', '-c', script, 'test', str(ROOT), folder], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('config:\n', result.stdout)
+            self.assertIn('/mock-source/scripts/debian_headers.py mock-kernel /mock-work/headers --archive-wait-minutes 30', result.stdout)
+
+    def test_archive_wait_flag_rejects_missing_or_invalid_values(self):
+        for value in ([], ['0'], ['31'], ['-1'], ['1.5'], ['yes']):
+            with self.subTest(value=value):
+                result = subprocess.run(['bash', str(ROOT / 'install.sh'), '--archive-wait-minutes'] + value,
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('--archive-wait-minutes', result.stderr)
+
     def test_missing_headers_refresh_index_when_other_packages_are_installed(self):
-        if Path('/proc/net/tcp_brutal/rules').exists():
-            self.skipTest('Loaded Brutal module bypasses header installation')
-        # Stop at the simulated headers install; never build or load a module.
+        # Exercise headers acquisition directly, independent of loaded host modules.
         script = '''
 source "$1/install.sh"
-uname() { echo brutal-watch-test-missing-headers; }
-modinfo() { return 1; }
 dpkg-query() { echo installed; }
+apt-cache() { echo 'Candidate: 1.0'; }
 apt-get() { echo "apt:$*"; [[ "$1" == update ]]; }
-install_module
+install_packages dkms gcc make libc6-dev
+ensure_headers brutal-watch-test-missing-headers
 '''
         result = subprocess.run(['bash', '-c', script, 'test', str(ROOT)], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('无法取得 brutal-watch-test-missing-headers 的 headers', result.stderr)
+        self.assertIn('安装 brutal-watch-test-missing-headers 的 headers 失败', result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
             'apt:update',
             'apt:install -y --no-install-recommends linux-headers-brutal-watch-test-missing-headers',
@@ -97,6 +158,33 @@ install_module
                 result = subprocess.run(['bash', '-c', command, 'test', str(ROOT), str(archive), str(out)], capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((root / 'escaped').exists())
+
+    def test_existing_headers_do_not_refresh_or_use_archive(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'Makefile').write_text('')
+            script = '''source "$1/install.sh"
+apt-get() { echo unexpected-apt; return 1; }
+python3() { echo unexpected-archive; return 1; }
+ensure_headers mock-kernel "$2"
+'''
+            result = subprocess.run(['bash', '-c', script, 'test', str(ROOT), folder], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, '')
+
+    def test_only_debian_missing_candidate_uses_archive(self):
+        for distro, candidate in [('debian', False), ('debian', True), ('ubuntu', False), ('ubuntu', True)]:
+            with self.subTest(distro=distro, candidate=candidate), tempfile.TemporaryDirectory() as folder:
+                script = '''source "$1/install.sh"
+ID=$2; SOURCE_DIR=/mock-source; TMP_WORK=/mock-work
+apt-cache() { echo "Candidate: $4"; }
+apt-get() { echo "apt:$*"; }
+python3() { echo "archive:$*"; }
+ensure_headers mock-kernel "$3"
+'''.replace('echo "Candidate: $4"', 'echo ' + shlex.quote('Candidate: 1.0' if candidate else 'Candidate: (none)'))
+                result = subprocess.run(['bash', '-c', script, 'test', str(ROOT), distro, folder], capture_output=True, text=True)
+                self.assertEqual('archive:' in result.stdout, distro == 'debian' and not candidate)
+                self.assertEqual('apt:install' in result.stdout, candidate)
+                self.assertEqual(result.returncode == 0, candidate or distro == 'debian')
 
 
 class DockerClientTests(unittest.TestCase):

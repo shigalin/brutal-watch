@@ -36,3 +36,21 @@ GODEBUG: multipathtcp=0
 ```
 
 用户已授权这项最小运行配置调整。容器用同一镜像重建后，通过 pidfd 复制监听 FD 并读取 `SO_PROTOCOL`，确认 2053 监听器的协议号为 6（普通 TCP），不是 262（MPTCP）。随后恢复官方原版模块与加速任务。原 Compose 已备份；没有修改节点代码、镜像、端口或业务参数。
+
+## Debian 归档签名索引集成验证
+
+`verify_debian_headers_apt.py` 使用真实 `apt-get`、`apt-cache` 和系统 Debian 密钥环验证历史 headers 的认证下载。它临时加入无效系统源，以证明隔离查询不读取系统源；还用真实 dpkg 状态、空密钥环及恢复有效期检查作为反向验证。随后恢复正常源，按 headers 声明下载精确 `-common` 依赖、比对源码版本，并验证 `validate_plan` 能解析和接受真实 `apt-get -s` 的输出。检查前后会核对系统 APT 索引和 dpkg 状态内容一致。
+
+从仓库根目录执行下面的命令，只在一次性容器内安装测试依赖，仓库只读挂载。验证程序不安装内核或 headers，不加载模块，也不运行节点。
+
+```bash
+docker run --rm --platform linux/amd64 \
+  --mount "type=bind,source=$PWD,target=/work,readonly" \
+  debian:bookworm sh -ec '
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 curl ca-certificates
+    python3 -B /work/diagnostics/verify_debian_headers_apt.py --disposable-container
+  '
+```
+
+2026-09-25 已在 `debian:bookworm`（镜像摘要 `sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26`）通过 10 项检查：`linux-headers-6.1.0-18-amd64` / `6.1.76-1` 及其 `-common` 依赖的认证下载、源码版本比对、真实 APT 模拟安装计划，以及上述隔离/拒绝检查。此结果不覆盖宿主机当前内核包识别的成功路径、完整依赖链、arm64、trixie，也不代表 DKMS 编译、模块加载或节点验证已完成。

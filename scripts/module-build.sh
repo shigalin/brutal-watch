@@ -43,6 +43,14 @@ choose_compiler() {
   printf 'docker:%s\n' "$major"
 }
 
+compiler_image() {
+  if [[ "$1" == 13 ]]; then
+    printf '%s\n' 'gcc@sha256:3617a214e52a25bde5375dc9503b5e67f01b6c7322a30137e2790aa8e6db5d1f'
+  else
+    printf 'gcc:%s-bookworm\n' "$1"
+  fi
+}
+
 build_module() {
   local policy=$1 headers=$2 selected compiler major image build_dir
   [[ "$policy" == auto || "$policy" == native || "$policy" == docker ]] || return 2
@@ -56,10 +64,7 @@ build_module() {
     exec make -j2 KERNEL_DIR="$headers" CC="$compiler" all
   fi
   major=${selected#docker:}
-  image="gcc:$major-bookworm"
-  if [[ "$major" == 13 ]]; then
-    image='gcc@sha256:3617a214e52a25bde5375dc9503b5e67f01b6c7322a30137e2790aa8e6db5d1f'
-  fi
+  image=$(compiler_image "$major")
   docker info >/dev/null 2>&1 || { echo '容器编译需要运行中的 Docker；未更换宿主机编译器' >&2; return 1; }
   docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
   build_dir=$(pwd -P)

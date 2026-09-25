@@ -21,6 +21,40 @@ CFG = {'container': 'xboard-node', 'ports': [2053], 'rate_mbps': 100,
        'ttl_seconds': 1800, 'max_ips': 1024, 'exclude_cidrs': []}
 
 
+class CLIEncodingTests(unittest.TestCase):
+    def status(self, fail=False):
+        host = FakeHost()
+        host.remaining_connections = None
+        if fail:
+            def fail_boot_id():
+                raise w.WatchError('中文错误')
+            host.boot_id = fail_boot_id
+        with tempfile.TemporaryDirectory() as folder:
+            out, err = io.BytesIO(), io.BytesIO()
+            with io.TextIOWrapper(out, encoding='latin-1') as stdout, \
+                 io.TextIOWrapper(err, encoding='latin-1') as stderr, \
+                 patch.object(w.sys, 'stdout', stdout), patch.object(w.sys, 'stderr', stderr), \
+                 patch.object(w.sys, 'argv', ['brutal-watch', 'status']), \
+                 patch.object(w.sys, 'platform', 'linux'), patch.object(w.os, 'geteuid', return_value=0), \
+                 patch.object(w, 'Host', return_value=host), \
+                 patch.object(w, 'STATE', Path(folder) / 'state.json'), \
+                 patch.object(w, 'LOCK', Path(folder) / 'watch.lock'):
+                result = w.main()
+                stdout.flush(); stderr.flush()
+                return result, out.getvalue().decode('utf-8'), err.getvalue().decode('utf-8')
+
+    def test_status_prints_utf8_under_latin1_output(self):
+        result, output, error = self.status()
+        self.assertEqual(result, 0, error)
+        self.assertIn('规则为空', json.loads(output)['connection_inspection'])
+
+    def test_error_prints_utf8_under_latin1_output(self):
+        result, output, error = self.status(fail=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(output, '')
+        self.assertIn('中文错误', error)
+
+
 class FakeHost:
     def __init__(self):
         self.boot = 'boot-one'

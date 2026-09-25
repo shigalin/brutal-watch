@@ -18,6 +18,10 @@ watch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(watch)
 
 
+class ImageMismatch(ValueError):
+    pass
+
+
 def merge_godebug(value):
     if not isinstance(value, str) or '$' in value:
         raise ValueError('GODEBUG 使用动态插值或非字符串值，请手动配置，避免破坏原有语义')
@@ -183,16 +187,21 @@ def configure_node(cfg):
     atomic_text(target, changed, target.stat().st_mode & 0o777)
     recreate = command + ['up', '-d', '--no-deps', '--no-build', '--force-recreate', name]
     recreate_started = False
+    stage = 'Compose 配置渲染'
     try:
         # Capture rendered config privately: it can contain credentials.
         rendered = yaml.safe_load(host.run(command + ['config'], timeout=30, cwd=working_dir))
+        stage = '节点镜像一致性检查'
         image = rendered['services'][name]['image']
         actual = host.run(['docker', 'image', 'inspect', '-f', '{{.Id}}', image])
         if actual != obj['Image']:
-            raise ValueError('本地镜像标签已变化，拒绝借配置调整更换节点镜像')
+            raise ImageMismatch('本地镜像标签已变化，拒绝借配置调整更换节点镜像')
+        stage = '输出节点调整日志'
         print('修改 GODEBUG 并重建目标容器；备份：' + str(backup), flush=True)
+        stage = '重建目标容器'
         recreate_started = True
         host.run(recreate, timeout=90, cwd=working_dir)
+        stage = '普通 TCP 监听检查'
         last = None
         for _ in range(20):
             try:
@@ -203,16 +212,30 @@ def configure_node(cfg):
                 last = exc
                 time.sleep(1)
         if last: raise last
-    except Exception:
-        atomic_text(target, raw, backup.stat().st_mode & 0o777)
+    except Exception as exc:
+        # Captured Compose output/YAML snippets may contain credentials. Only
+        # protocol checks and this fixed image error have safe user-facing text.
+        detail = type(exc).__name__
+        if isinstance(exc, (watch.UnsafeListener, ImageMismatch)):
+            detail = str(exc)
+        reason = '{}失败（{}）'.format(stage, detail)
+        try:
+            atomic_text(target, raw, backup.stat().st_mode & 0o777)
+        except Exception as restore_error:
+            container_state = ('已尝试按修改后的配置重建容器，容器尚未回滚，运行状态需人工确认'
+                               if recreate_started else '容器未重建')
+            raise ValueError(reason + '；原文件恢复失败（' + type(restore_error).__name__ + '）；' + container_state + '；请检查备份：' + str(backup)) from None
         if recreate_started:
             try:
                 if host.run(['docker', 'image', 'inspect', '-f', '{{.Id}}', image]) != obj['Image']:
                     raise ValueError('image changed during rollback')
                 host.run(recreate, timeout=90, cwd=working_dir)
-            except Exception:
-                raise ValueError('节点调整失败，文件已恢复但容器恢复失败；请检查备份：' + str(backup)) from None
-        raise ValueError('节点调整未通过验证，已恢复原文件和容器；备份：' + str(backup)) from None
+            except Exception as restore_error:
+                raise ValueError(reason + '；原文件已恢复，但容器回滚失败（' + type(restore_error).__name__ + '）；请检查备份：' + str(backup)) from None
+            recovery = '原文件和容器已恢复'
+        else:
+            recovery = '原文件已恢复，容器未重建'
+        raise ValueError(reason + '；' + recovery + '；备份：' + str(backup)) from None
 
 
 def resolve_mptcp_block(cfg):
@@ -234,6 +257,7 @@ def resolve_mptcp_block(cfg):
 
 
 def main():
+    watch.configure_output()
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['idle', 'config', 'configure-node', 'verify-node', 'resolve-mptcp-block'])
     parser.add_argument('--container')

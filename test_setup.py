@@ -106,12 +106,20 @@ class ConfigTests(unittest.TestCase):
 
 
 class ConfigureTransactionTests(unittest.TestCase):
-    def run_case(self, changed_image=False, fail_restart=False, unsafe=False, relative_path=False):
+    def run_case(self, changed_image=False, fail_restart=False, unsafe=False, relative_path=False,
+                 cli_stdout=None, fail_config=False, fail_rollback=False, fail_restore=False):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'compose.yml'
             original = 'services:\n  node:\n    image: example:stable\n'
             path.write_text(original)
             actions = []
+            atomic_text = setup.atomic_text
+            writes = []
+            def write_file(*args):
+                writes.append(args)
+                if fail_restore and len(writes) == 2:
+                    raise OSError('private-file-error')
+                return atomic_text(*args)
             class Host:
                 def run(self, argv, **kwargs):
                     actions.append((argv, kwargs))
@@ -124,21 +132,55 @@ class ConfigureTransactionTests(unittest.TestCase):
                     if argv[:3] == ['docker', 'compose', 'version']: return '2.30'
                     if argv[:3] == ['docker', 'image', 'inspect']:
                         return 'sha256:new' if changed_image else 'sha256:old'
-                    if argv[-1] == 'config': return path.read_text()
+                    if argv[-1] == 'config':
+                        if fail_config: raise setup.watch.WatchError('PANEL_TOKEN=private-test-value')
+                        return path.read_text()
                     if 'up' in argv:
                         attempts = sum('up' in a[0] for a in actions)
                         if fail_restart and attempts == 1: raise setup.watch.WatchError('simulated failure')
+                        if fail_rollback and attempts == 2: raise setup.watch.WatchError('private-rollback-output')
                         return ''
                     raise AssertionError(argv)
                 def peers(self, cfg):
                     if unsafe: raise setup.watch.UnsafeListener('still MPTCP')
                     return set()
-            with patch.object(setup.watch, 'Host', Host), patch.object(setup.time, 'sleep'), contextlib.redirect_stdout(io.StringIO()):
-                if changed_image or fail_restart or unsafe:
-                    with self.assertRaises(ValueError): setup.configure_node({'container': 'node', 'ports': [2053]})
-                    self.assertEqual(path.read_text(), original)
+            with patch.object(setup.watch, 'Host', Host), patch.object(setup.time, 'sleep'), \
+                 patch.object(setup, 'atomic_text', write_file), \
+                 contextlib.redirect_stdout(cli_stdout if cli_stdout is not None else io.StringIO()):
+                if changed_image or fail_restart or unsafe or fail_config:
+                    with self.assertRaises(ValueError) as caught:
+                        setup.configure_node({'container': 'node', 'ports': [2053]})
+                    message = str(caught.exception)
+                    self.assertNotIn('private-', message)
+                    if fail_restore:
+                        self.assertIn('原文件恢复失败', message)
+                        if unsafe or fail_restart:
+                            self.assertIn('容器尚未回滚', message)
+                            self.assertIn('运行状态需人工确认', message)
+                        else:
+                            self.assertIn('容器未重建', message)
+                    elif changed_image or fail_config:
+                        self.assertIn('容器未重建', message)
+                    elif fail_rollback:
+                        self.assertIn('容器回滚失败', message)
+                    else:
+                        self.assertIn('原文件和容器已恢复', message)
+                    if fail_config: self.assertIn('Compose 配置渲染失败', message)
+                    if changed_image: self.assertIn('本地镜像标签已变化', message)
+                    if fail_restart: self.assertIn('重建目标容器失败', message)
+                    if unsafe: self.assertIn('普通 TCP 监听检查失败', message)
+                    if fail_restore:
+                        self.assertEqual(next(path.parent.glob('*.before-brutal-watch-*')).read_text(), original)
+                    else:
+                        self.assertEqual(path.read_text(), original)
                 else:
-                    setup.configure_node({'container': 'node', 'ports': [2053]})
+                    cfg = {'container': 'node', 'ports': [2053]}
+                    if cli_stdout is None:
+                        setup.configure_node(cfg)
+                    else:
+                        with patch.object(setup.sys, 'argv', ['setup.py', 'configure-node']), \
+                             patch.object(setup.watch, 'config_load', return_value=cfg):
+                            self.assertEqual(setup.main(), 0)
                     self.assertEqual(yaml.safe_load(path.read_text())['services']['node']['environment'], {'GODEBUG': 'multipathtcp=0'})
             self.assertEqual(len(list(path.parent.glob('*.before-brutal-watch-*'))), 1)
             commands = [a[0] for a in actions if 'up' in a[0]]
@@ -154,6 +196,16 @@ class ConfigureTransactionTests(unittest.TestCase):
         self.assertIn('--no-deps', commands[0])
         self.assertIn('--no-build', commands[0])
         self.assertEqual(commands[0][-1], 'node')
+
+    def test_latin1_output_does_not_trigger_configuration_rollback(self):
+        out, err = io.BytesIO(), io.BytesIO()
+        with io.TextIOWrapper(out, encoding='latin-1') as stdout, \
+             io.TextIOWrapper(err, encoding='latin-1') as stderr, contextlib.redirect_stderr(stderr):
+            self.assertEqual(len(self.run_case(cli_stdout=stdout)), 1)
+            stdout.flush(); stderr.flush()
+            self.assertIn('修改 GODEBUG', out.getvalue().decode('utf-8'))
+            self.assertIn('普通 TCP 监听验证通过', out.getvalue().decode('utf-8'))
+            self.assertEqual(err.getvalue(), b'')
 
     def test_changed_image_restores_file_without_restarting(self):
         self.assertEqual(self.run_case(changed_image=True), [])
@@ -177,6 +229,18 @@ class ConfigureTransactionTests(unittest.TestCase):
 
     def test_still_mptcp_rolls_back_instead_of_claiming_success(self):
         self.assertEqual(len(self.run_case(unsafe=True)), 2)
+
+    def test_config_error_reports_stage_without_leaking_output(self):
+        self.assertEqual(self.run_case(fail_config=True), [])
+
+    def test_rollback_failure_is_reported_separately(self):
+        self.assertEqual(len(self.run_case(fail_restart=True, fail_rollback=True)), 2)
+
+    def test_file_restore_failure_keeps_backup_and_reports_failure(self):
+        self.assertEqual(self.run_case(changed_image=True, fail_restore=True), [])
+
+    def test_restore_failure_after_recreate_reports_container_not_rolled_back(self):
+        self.assertEqual(len(self.run_case(unsafe=True, fail_restore=True)), 1)
 
 
 if __name__ == '__main__': unittest.main()

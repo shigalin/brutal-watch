@@ -14,6 +14,7 @@ SKIP_MODULE=0
 COMPILER=auto
 TMP_WORK=
 CONFIG_ARGS=()
+ARCHIVE_ARGS=()
 PACKAGE_INDEX_UPDATED=0
 
 usage() {
@@ -25,6 +26,7 @@ usage() {
   --ttl-seconds 1800    最后出现后的保留时间
   --max-ips 1024        最大状态条目数
   --compiler POLICY    auto（默认）/ native / docker
+  --archive-wait-minutes N  预授权本次归档查找最多等待 N 分钟（1–30），不再交互确认
   --configure-node     允许备份并调整现有 Compose 的 GODEBUG，重建一次节点容器
   --enable             安装、验证完成后开启加速及开机自启
   --skip-module        使用已安装的模块，不安装 DKMS 或编译模块
@@ -51,6 +53,10 @@ parse_args() {
       --compiler)
         (($# >= 2)) || die '--compiler 缺少参数'
         COMPILER=$2; shift 2 ;;
+      --archive-wait-minutes)
+        (($# >= 2)) || die '--archive-wait-minutes 缺少参数'
+        [[ "$2" =~ ^([1-9]|[12][0-9]|30)$ ]] || die '--archive-wait-minutes 必须是 1–30 的整数'
+        ARCHIVE_ARGS=(--archive-wait-minutes "$2"); shift 2 ;;
       --container|--ports|--rate-mbps|--ttl-seconds|--max-ips)
         (($# >= 2)) || die "$1 缺少参数"
         CONFIG_ARGS+=("$1" "$2"); shift 2 ;;
@@ -169,41 +175,75 @@ project_source() {
   [[ -f "$SOURCE_DIR/brutal_watch.py" && -f "$SOURCE_DIR/scripts/module-build.sh" ]] || die '下载的项目文件不完整'
 }
 
-install_module() {
-  local kernel source headers override config
-  kernel=$(uname -r)
+module_mode() {
   if [[ -e /proc/net/tcp_brutal/rules ]]; then
-    echo '复用已加载的 v2 模块；保留原有安装方式和升级策略'
-    return
-  fi
-  if [[ "$SKIP_MODULE" == 1 ]]; then
-    modprobe brutal || die '无法加载现有 brutal 模块'
-    [[ -e /proc/net/tcp_brutal/rules ]] || die '当前模块没有 v2 规则接口'
-    return
-  fi
-  if modinfo -F version brutal 2>/dev/null | grep -q '^2\.'; then
-    modprobe brutal
-    [[ -e /proc/net/tcp_brutal/rules ]] || die '加载后缺少 v2 规则接口'
-    echo '复用磁盘上已有的 v2 模块；未覆盖现有模块'
-    return
-  fi
-  if modinfo brutal >/dev/null 2>&1; then
+    echo loaded
+  elif [[ "$SKIP_MODULE" == 1 ]]; then
+    echo existing
+  elif modinfo -F version brutal 2>/dev/null | grep -q '^2\.'; then
+    echo existing
+  elif modinfo brutal >/dev/null 2>&1; then
     die '发现旧版或未知 brutal 模块，请先按原安装方式迁移；不会覆盖或强制卸载'
+  else
+    echo build
   fi
+}
+
+prepare_module() {
+  local kernel headers config selected image mode
+  mode=$(module_mode) || return 1
+  [[ "$mode" == build ]] || return 0
+  kernel=$(uname -r)
   install_packages dkms gcc make libc6-dev
   headers="/lib/modules/$kernel/build"
-  if [[ ! -f "$headers/Makefile" ]]; then
-    update_package_index
-    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends "linux-headers-$kernel" \
-      || die "无法取得 $kernel 的 headers；定制内核需要其提供方的匹配 headers，不会替换内核"
-  fi
-  [[ -f "$headers/Makefile" ]] || die '内核 headers 不完整'
+  ensure_headers "$kernel" "$headers"
+  [[ -f "$headers/Makefile" ]] || die '内核 headers 不完整，请修复当前内核的 headers 包'
   source "$SOURCE_DIR/scripts/module-build.sh"
   config=$(kernel_config "$headers") || die '内核 headers 不完整'
   if grep -q '^CONFIG_CC_IS_CLANG=y' "$config"; then
     [[ "$COMPILER" != docker ]] || die 'Clang 内核请使用 --compiler auto 或 native；Docker 编译目前仅支持 GCC'
     install_packages clang lld llvm
   fi
+  selected=$(choose_compiler "$headers" "$COMPILER") || die '编译工具链检查失败；尚未调整节点'
+  if [[ "$selected" == docker:* ]]; then
+    image=$(compiler_image "${selected#docker:}")
+    docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" \
+      || die '无法取得编译器镜像；尚未调整节点'
+  fi
+}
+
+ensure_headers() {
+  local kernel=$1 headers=${2:-/lib/modules/$1/build}
+  [[ ! -f "$headers/Makefile" ]] || return 0
+  update_package_index
+  if LC_ALL=C apt-cache policy "linux-headers-$kernel" 2>/dev/null \
+      | awk '$1 == "Candidate:" && $2 != "(none)" {found=1} END {exit !found}'; then
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends "linux-headers-$kernel" \
+      || die "安装 $kernel 的 headers 失败，请检查上面的 apt 错误；尚未调整节点"
+  elif [[ ${ID:-} == debian ]]; then
+    python3 "$SOURCE_DIR/scripts/debian_headers.py" "$kernel" "$TMP_WORK/headers" ${ARCHIVE_ARGS[@]+"${ARCHIVE_ARGS[@]}"} \
+      || die "无法补齐 $kernel 的精确 headers；尚未调整节点，不会替换内核"
+  else
+    die "当前软件源没有 $kernel 的精确 headers，请检查软件源或内核提供方；尚未调整节点，不会替换内核"
+  fi
+}
+
+install_module() {
+  local kernel source headers override mode
+  mode=$(module_mode) || return 1
+  kernel=$(uname -r)
+  if [[ "$mode" == loaded ]]; then
+    echo '复用已加载的 v2 模块；保留原有安装方式和升级策略'
+    return
+  fi
+  if [[ "$mode" == existing ]]; then
+    modprobe brutal || die '无法加载现有 brutal 模块'
+    [[ -e /proc/net/tcp_brutal/rules ]] || die '当前模块没有 v2 规则接口'
+    echo '复用磁盘上已有的 v2 模块；未覆盖现有模块'
+    return
+  fi
+  headers="/lib/modules/$kernel/build"
+  [[ -f "$headers/Makefile" ]] || die '内核 headers 不完整'
   source="/usr/src/$MODULE_NAME-$DKMS_VERSION"
   if [[ ! -d "$source" ]]; then
     curl -fL --connect-timeout 15 --max-time 120 --retry 2 \
@@ -270,11 +310,14 @@ main() {
   project_source
   python3 "$SOURCE_DIR/scripts/setup.py" idle
   python3 "$SOURCE_DIR/scripts/setup.py" config ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"}
-  install_tool
   if [[ "$CONFIGURE_NODE" == 1 ]]; then
+    prepare_module
+    install_tool
     python3 "$SOURCE_DIR/scripts/setup.py" configure-node
   else
-    python3 "$SOURCE_DIR/scripts/setup.py" verify-node || die '工具已安装；节点未通过普通 TCP 检查。可显式使用 --configure-node 或按文档手动调整'
+    python3 "$SOURCE_DIR/scripts/setup.py" verify-node || die '节点未通过普通 TCP 检查；尚未准备模块或更新工具。可显式使用 --configure-node 或按文档手动调整'
+    prepare_module
+    install_tool
   fi
   install_module
   python3 "$SOURCE_DIR/scripts/setup.py" resolve-mptcp-block
