@@ -31,11 +31,15 @@
 
 ## 安装和命令
 
-安装命令和平台要求见 [README](README.md)。默认安装会自动补齐缺少的依赖、验证普通 TCP 监听、安装或复用官方 v2 模块；不自动改变节点配置或开启加速。`--configure-node` 和 `--enable` 分别明确授权这两项操作。
+安装命令和平台要求见 [README](README.md)。默认安装会自动补齐缺少的依赖、验证普通 TCP 监听、安装或升级官方 v2 模块，同版本不重编译；`--skip-module` 才保留旧 v2 模块。不自动改变节点配置或开启加速。`--configure-node` 和 `--enable` 分别明确授权这两项操作。
 
-DKMS 包名是 `tcp-brutal`，实际内核模块名是 `brutal`。新安装的源码及 DKMS 构建配置保存在 `/usr/src/tcp-brutal-2.0.0-bw644db52`、`/etc/dkms/tcp-brutal-2.0.0-bw644db52.conf`，构建入口为 `/usr/local/libexec/brutal-watch/module-build`。复用既有模块时不会自动升级到上述版本，手工安装也不会自动转换为 DKMS；实际版本及路径以本机安装记录为准。
+DKMS 包名是 `tcp-brutal`，实际内核模块名是 `brutal`。当前固定官方 v2.0.1（提交 `d2397ff8bca04a29fd2de01cf7d2d4b825224de8`，下载归档校验 SHA256）；目标版本随本项目更新，不动态追踪上游发布。新安装的源码及 DKMS 构建配置保存在 `/usr/src/tcp-brutal-2.0.1-bwd2397ff`、`/etc/dkms/tcp-brutal-2.0.1-bwd2397ff.conf`，构建入口为 `/usr/local/libexec/brutal-watch/module-build`。旧 v2 默认升级，同版本或 `--skip-module` 复用手工安装时不转换为 DKMS。
 
-编译入口优先读取 headers 的 `include/config/auto.conf`，不存在时使用 `.config`，与上游 Makefile 的配置选择顺序一致。GCC 内核沿用匹配本机 GCC、必要时使用 GCC 容器的流程。Clang 内核在 `--compiler auto` / `native` 下由安装器补齐 `clang`、`lld`、`llvm`，通过上游 `LLVM=1` 机制构建，不传入 GCC 的 `CC=` 覆盖；显式选择 `--compiler docker` 会拒绝，因为现有容器编译路径仅支持 GCC。定制内核若要求其他 LLVM 版本，需准备兼容工具链；后续 DKMS 重建也要求工具链可用。
+直接重跑安装入口，无需手动 `off` 或额外升级参数。安装器会自动调用已有工具关闭加速、确认本工具规则和路由清理完成，再更新文件。旧项目 DKMS 版本（如 `2.0.0-bw644db52`）和官方/手工安装的 v2.0.0 均进入新版本构建流程；不使用强制安装、不删除旧源码及 DKMS 注册。升级只针对当前运行内核，其他内核及外部安装任务由管理员协调。未知版本、v1 或高于目标的版本会拒绝覆盖。安装成功后默认保持关闭，只有 `--enable` 才会在检查通过后自动开启。
+
+安装器分别验证 `modinfo -F version brutal` 的磁盘版本和 `/sys/module/brutal/version` 的实际加载版本。磁盘已更新、内存仍为旧版时，返回非零并提示待重启，停止后续检查和自动开启。不会强卸载模块或自动重启；管理员安排重启后重跑安装器，确认版本及普通 TCP 检查通过，再 `brutal-watch on`。同版本复用不需要重新编译。DKMS 安装失败或磁盘仍指向旧模块时，保持关闭，核查 `dkms status`、`modinfo -n brutal` 后重试；不能以磁盘文件更新宣称运行中升级已生效。独立 `brutal-watch check/on` 没有磁盘与加载版本比较，检查通过也不代表升级生效；待重启时应按安装器提示完成验证。
+
+编译入口优先读取 headers 的 `include/config/auto.conf`，不存在时使用 `.config`，与上游 Makefile 的配置选择顺序一致。GCC 内核沿用匹配本机 GCC、必要时使用 GCC 容器的流程。Clang 内核在 `--compiler auto` / `native` 下由安装器补齐 `clang`、`lld`、`llvm`，由上游 Makefile 自动传入 `LLVM=1`，本地不重复传参，也不传入 GCC 的 `CC=` 覆盖；显式选择 `--compiler docker` 会拒绝，因为现有容器编译路径仅支持 GCC。定制内核若要求其他 LLVM 版本，需准备兼容工具链；后续 DKMS 重建也要求工具链可用。BBRv3 内核的 TSO 钩子兼容完全使用官方 v2.0.1 实现。
 
 ```text
 brutal-watch check   # 只读检查模块接口、实际 TCP 协议、容器、端口、策略路由及状态文件
@@ -74,7 +78,7 @@ brutal-watch status  # 输出 JSON：开关、自启、IP/到期时间、规则/
 
 修改 `rate_mbps` 前先 `off` 并确认规则清理完成，再修改并 `on`。既有 TCP 连接仍可能保留旧速率直到关闭，这不是实时切换所有连接的接口。
 
-更新工具前先 `off`；安装器在 timer/service 仍活动、运行锁被占用或状态仍有待清理条目时拒绝覆盖程序。迁移到此独立项目不改变 `/etc/brutal-watch`、`/var/lib/brutal-watch` 或服务名称，现有配置/状态可继续使用。
+重复安装先取得独立安装锁，准备依赖和项目文件；只读校验有效配置、在未指定 `--configure-node` 时验证节点，然后核查模块待重启状态、源码及 DKMS 配置归属，准备源码和编译依赖，最后才通过固定路径 `/usr/local/sbin/brutal-watch` 自动调用 `off`。预检失败不会关闭已有加速；下载并验 SHA256 的新源码仅解包到临时目录，正式源码、DKMS 配置写入和编译仍在关闭后执行，写入前再核查归属。配置写入和节点重建仍在运行锁内。单轮最多清理 32 条；残留条目旧错误引起的退出码 1 不直接判为失败，只要后续批次剩余数量下降就继续，直到记录为空。顶层错误、异常退出、无进展或无法解析状态时输出本轮清理报告并停止，保留原工具和定时清理重试。清理完成后同步停止 timer/service，再取得运行锁并复核空闲状态，避免持有运行锁调用 `off` 或等待 systemd 任务造成死锁。仍有活动任务、并发命令或待清理记录时拒绝覆盖程序。迁移到此独立项目不改变 `/etc/brutal-watch`、`/var/lib/brutal-watch` 或服务名称，现有配置及状态清理机制继续使用。
 
 安装器不会自动清除未知故障标记。原 MPTCP 标记只有在模块接口可用、所有目标监听 socket 实际确认为普通 TCP 后才会解除；内核异常仍需先人工恢复主机，不能靠删除标记处理。
 
@@ -89,8 +93,8 @@ bash -n install.sh scripts/module-build.sh
 
 ## 上游依据
 
-- [TCP Brutal v2 README（核对版本 644db52）](https://github.com/HyNetworks/tcp-brutal/blob/644db5226173dba741fe2b593082702fa7b16108/README.md)
+- [TCP Brutal v2.0.1 发布说明](https://github.com/HyNetworks/tcp-brutal/releases/tag/v2.0.1)
 - [Clang 内核构建支持](https://github.com/HyNetworks/tcp-brutal/commit/b885a05541f99d9f741a92f5b38a1418fce7fa10)
-- [规则接口与删除生命周期](https://github.com/HyNetworks/tcp-brutal/blob/644db5226173dba741fe2b593082702fa7b16108/brutal_rules.c)
-- [brutalctl 的路由管理实现](https://github.com/HyNetworks/tcp-brutal/blob/644db5226173dba741fe2b593082702fa7b16108/tools/brutalctl.c)
+- [规则接口与删除生命周期](https://github.com/HyNetworks/tcp-brutal/blob/d2397ff8bca04a29fd2de01cf7d2d4b825224de8/brutal_rules.c)
+- [brutalctl 的路由管理实现](https://github.com/HyNetworks/tcp-brutal/blob/d2397ff8bca04a29fd2de01cf7d2d4b825224de8/tools/brutalctl.c)
 - [iproute2 路由输出实现](https://github.com/iproute2/iproute2/blob/main/ip/iproute.c)

@@ -91,6 +91,37 @@ class ConfigTests(unittest.TestCase):
                     setup.write_config(self.args(ports=[0]))
             self.assertFalse(path.exists())
 
+    def test_node_preflight_uses_first_install_arguments_without_writing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'new' / 'config.json'
+            with patch.object(setup.watch, 'CONFIG', path), patch.object(setup.watch, 'Host') as host, \
+                    patch('sys.argv', ['setup.py', 'verify-node', '--container', 'custom-node', '--ports', '443']), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                host.return_value.peers.return_value = set()
+                self.assertEqual(setup.main(), 0)
+                cfg = host.return_value.peers.call_args[0][0]
+                self.assertEqual(cfg['container'], 'custom-node')
+                self.assertEqual(cfg['ports'], [443])
+                self.assertFalse(path.parent.exists())
+                self.assertEqual(setup.write_config(self.args(container='custom-node', ports=[443])), cfg)
+
+    def test_config_preflight_rejects_invalid_or_conflicting_arguments(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'config.json'
+            with patch.object(setup.watch, 'CONFIG', path), patch.object(setup.watch, 'Host') as host:
+                with self.assertRaises(setup.watch.WatchError):
+                    setup.write_config(self.args(ports=[0]), dry_run=True)
+                self.assertFalse(path.exists())
+                setup.write_config(self.args(ports=[443]))
+                previous = path.read_bytes()
+                for action in ('validate-config', 'verify-node'):
+                    with self.subTest(action=action), \
+                            patch('sys.argv', ['setup.py', action, '--ports', '2053']), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(setup.main(), 1)
+                        self.assertEqual(path.read_bytes(), previous)
+                host.assert_not_called()
+
     def test_reinstall_preserves_user_settings(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'config.json'

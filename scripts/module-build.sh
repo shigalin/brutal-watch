@@ -57,7 +57,8 @@ build_module() {
   headers=$(readlink -f "$headers")
   selected=$(choose_compiler "$headers" "$policy")
   if [[ "$selected" == native:llvm ]]; then
-    exec make -j2 KERNEL_DIR="$headers" LLVM=1 all
+    # Upstream detects CONFIG_CC_IS_CLANG and supplies LLVM=1 to Kbuild.
+    exec make -j2 KERNEL_DIR="$headers" all
   fi
   if [[ "$selected" == native:* ]]; then
     compiler=${selected#native:}

@@ -3,11 +3,15 @@
 set -Eeuo pipefail
 PROJECT_REPO=shigalin/brutal-watch
 PROJECT_REF=${BRUTAL_WATCH_REF:-main}
-UPSTREAM_COMMIT=644db5226173dba741fe2b593082702fa7b16108
-UPSTREAM_SHA256=8e37baa6ac7844c618005e90f6a204fb858865f25988a62de0d9a21cdfa08be6
-DKMS_VERSION=2.0.0-bw644db52
+UPSTREAM_COMMIT=d2397ff8bca04a29fd2de01cf7d2d4b825224de8
+UPSTREAM_SHA256=53da436ed1c42094bc8eb73b4d2920ec8ba061990974dad5765cb93cb5148f1b
+MODULE_VERSION=2.0.1
+DKMS_VERSION=2.0.1-bwd2397ff
 MODULE_NAME=tcp-brutal
+MODULE_SOURCE=/usr/src/$MODULE_NAME-$DKMS_VERSION
+DKMS_OVERRIDE=/etc/dkms/$MODULE_NAME-$DKMS_VERSION.conf
 LIBEXEC=/usr/local/libexec/brutal-watch
+WATCH_COMMAND=/usr/local/sbin/brutal-watch
 CONFIGURE_NODE=0
 ENABLE=0
 SKIP_MODULE=0
@@ -31,7 +35,8 @@ usage() {
   --enable             安装、验证完成后开启加速及开机自启
   --skip-module        使用已安装的模块，不安装 DKMS 或编译模块
   --help               查看帮助
-默认只安装并检查，不调整节点、不启用加速。运行中的旧版本须先 off。
+默认安装或升级到项目固定的最新官方稳定版，不调整节点、不启用加速。
+重复安装会自动 off 并确认规则清理完成；内存中旧模块不会强制卸载，升级后可能需要手动重启。
 只支持 Debian/Ubuntu、systemd、x86_64/aarch64、现有 Docker host 网络节点。
 EOF
 }
@@ -78,9 +83,6 @@ check_platform() {
   . /etc/os-release
   [[ ${ID:-} == debian || ${ID:-} == ubuntu ]] || die '当前一键依赖安装仅支持 Debian/Ubuntu'
   [[ -d /run/systemd/system ]] || die '需要宿主机 systemd；不要在普通 Docker 容器内运行安装器'
-  if systemctl is-active --quiet brutal-watch.timer || systemctl is-active --quiet brutal-watch.service; then
-    die 'brutal-watch 仍在运行，请先 off；更新不会擅自停止节点或覆盖运行中的工具'
-  fi
 }
 
 check_docker() {
@@ -175,24 +177,99 @@ project_source() {
   [[ -f "$SOURCE_DIR/brutal_watch.py" && -f "$SOURCE_DIR/scripts/module-build.sh" ]] || die '下载的项目文件不完整'
 }
 
-module_mode() {
-  if [[ -e /proc/net/tcp_brutal/rules ]]; then
-    echo loaded
-  elif [[ "$SKIP_MODULE" == 1 ]]; then
-    echo existing
-  elif modinfo -F version brutal 2>/dev/null | grep -q '^2\.'; then
-    echo existing
-  elif modinfo brutal >/dev/null 2>&1; then
-    die '发现旧版或未知 brutal 模块，请先按原安装方式迁移；不会覆盖或强制卸载'
-  else
-    echo build
+loaded_module_version() {
+  local version
+  if [[ -d /sys/module/brutal ]]; then
+    if [[ ! -r /sys/module/brutal/version ]]; then
+      echo '已加载 brutal 模块未提供可读的 version 文件，版本未知；请按原安装方式确认并迁移，不会覆盖模块' >&2
+      return 1
+    fi
+    version=$(cat /sys/module/brutal/version) || return 1
+    [[ -n "$version" ]] || return 1
+    printf '%s\n' "$version"
   fi
+}
+
+module_has_rules() { [[ -e /proc/net/tcp_brutal/rules ]]; }
+
+module_mode() {
+  local disk loaded version
+  disk=$(modinfo -F version brutal 2>/dev/null || true)
+  loaded=$(loaded_module_version) || die '无法读取已加载 brutal 模块版本'
+  if [[ "$SKIP_MODULE" != 1 ]]; then
+    for version in "$disk" "$loaded"; do
+      [[ -n "$version" ]] || continue
+      [[ "$version" =~ ^2\.[0-9]+\.[0-9]+$ ]] || die "不支持自动迁移模块版本 ${version}，请按原安装方式处理"
+      if dpkg --compare-versions "$version" gt "$MODULE_VERSION"; then
+        die "已有模块 $version 新于目标 ${MODULE_VERSION}，拒绝降级"
+      fi
+    done
+    if [[ -z "$disk" ]] && modinfo brutal >/dev/null 2>&1; then
+      die '磁盘模块版本未知，拒绝覆盖'
+    fi
+    if [[ "$disk" == "$MODULE_VERSION" ]]; then
+      if [[ -n "$loaded" && "$loaded" != "$MODULE_VERSION" ]]; then
+        die "磁盘模块为 ${disk}，当前仍加载 ${loaded}；升级尚未生效，请安排手动重启后重跑安装器"
+      fi
+      echo existing
+    else
+      echo build
+    fi
+  elif [[ -n "$loaded" && -n "$disk" && "$loaded" != "$disk" ]]; then
+    die "磁盘模块为 ${disk}，当前仍加载 ${loaded}；请安排手动重启后重跑安装器，不会开启加速"
+  elif [[ -n "$loaded" && "$loaded" != 2.* ]]; then
+    die '已加载旧版或未知 brutal 模块，请先按原安装方式迁移'
+  elif module_has_rules; then
+    echo loaded
+  else
+    echo existing
+  fi
+}
+
+verify_module_version() {
+  local disk loaded
+  disk=$(modinfo -F version brutal) || die '安装后无法读取磁盘模块版本'
+  [[ "$disk" == "$MODULE_VERSION" ]] || die "磁盘仍解析到模块 ${disk}，预期 ${MODULE_VERSION}；请检查 DKMS 和模块路径，不会开启加速"
+  loaded=$(loaded_module_version) || die '无法读取已加载 brutal 模块版本'
+  if [[ -n "$loaded" && "$loaded" != "$MODULE_VERSION" ]]; then
+    die "新版 $MODULE_VERSION 已安装到磁盘，但当前仍加载 ${loaded}；升级尚未生效，加速保持关闭。请安排手动重启后重跑安装器验证，再执行 brutal-watch on；不会强卸载或自动重启"
+  fi
+  modprobe brutal || die '新版模块无法加载，请检查 DKMS、模块签名和内核日志'
+  loaded=$(loaded_module_version) || die '无法读取已加载 brutal 模块版本'
+  [[ "$loaded" == "$MODULE_VERSION" ]] || die "加载版本不是 ${MODULE_VERSION}，不会开启加速"
+  module_has_rules || die '模块加载后未提供 v2 规则接口，请检查模块签名和内核日志'
+}
+
+check_module_paths() {
+  if [[ -e "$MODULE_SOURCE" || -L "$MODULE_SOURCE" ]]; then
+    [[ -d "$MODULE_SOURCE" && $(cat "$MODULE_SOURCE/.brutal-watch-upstream" 2>/dev/null) == "$UPSTREAM_COMMIT" ]] \
+      || die '源码目录已有未知内容，拒绝覆盖'
+  fi
+  if [[ -e "$DKMS_OVERRIDE" || -L "$DKMS_OVERRIDE" ]]; then
+    grep -q '^# Managed by brutal-watch$' "$DKMS_OVERRIDE" \
+      || die '发现外部 DKMS 覆盖配置，拒绝覆盖'
+  fi
+}
+
+prepare_module_source() {
+  check_module_paths
+  [[ ! -d "$MODULE_SOURCE" ]] || return 0
+  curl -fL --connect-timeout 15 --max-time 120 --retry 2 \
+    "https://codeload.github.com/HyNetworks/tcp-brutal/tar.gz/$UPSTREAM_COMMIT" -o "$TMP_WORK/tcp-brutal.tar.gz" \
+    || die '上游模块源码下载失败；尚未关闭已有加速'
+  printf '%s  %s\n' "$UPSTREAM_SHA256" "$TMP_WORK/tcp-brutal.tar.gz" | sha256sum -c - \
+    || die '上游模块源码 SHA256 校验失败；尚未关闭已有加速'
+  mkdir "$TMP_WORK/module"
+  extract_archive "$TMP_WORK/tcp-brutal.tar.gz" "$TMP_WORK/module"
+  (cd "$TMP_WORK/module" && PACKAGE_VERSION="$DKMS_VERSION" bash scripts/mkdkmsconf.sh > dkms.conf)
+  printf '%s\n' "$UPSTREAM_COMMIT" > "$TMP_WORK/module/.brutal-watch-upstream"
 }
 
 prepare_module() {
   local kernel headers config selected image mode
   mode=$(module_mode) || return 1
   [[ "$mode" == build ]] || return 0
+  prepare_module_source
   kernel=$(uname -r)
   install_packages dkms gcc make libc6-dev
   headers="/lib/modules/$kernel/build"
@@ -233,54 +310,51 @@ install_module() {
   mode=$(module_mode) || return 1
   kernel=$(uname -r)
   if [[ "$mode" == loaded ]]; then
-    echo '复用已加载的 v2 模块；保留原有安装方式和升级策略'
+    echo '--skip-module：复用已加载的 v2 模块，未升级'
     return
   fi
   if [[ "$mode" == existing ]]; then
-    modprobe brutal || die '无法加载现有 brutal 模块'
-    [[ -e /proc/net/tcp_brutal/rules ]] || die '当前模块没有 v2 规则接口'
-    echo '复用磁盘上已有的 v2 模块；未覆盖现有模块'
+    if [[ "$SKIP_MODULE" != 1 ]]; then
+      verify_module_version
+    else
+      modprobe brutal || die '无法加载现有 brutal 模块'
+      module_has_rules || die '当前模块没有 v2 规则接口'
+    fi
+    echo '模块版本和规则接口检查完成；未重新编译现有模块'
     return
   fi
   headers="/lib/modules/$kernel/build"
   [[ -f "$headers/Makefile" ]] || die '内核 headers 不完整'
-  source="/usr/src/$MODULE_NAME-$DKMS_VERSION"
+  source=$MODULE_SOURCE
+  override=$DKMS_OVERRIDE
+  # Recheck ownership before writing; preparation does not reserve these paths.
+  check_module_paths
   if [[ ! -d "$source" ]]; then
-    curl -fL --connect-timeout 15 --max-time 120 --retry 2 \
-      "https://codeload.github.com/HyNetworks/tcp-brutal/tar.gz/$UPSTREAM_COMMIT" -o "$TMP_WORK/tcp-brutal.tar.gz"
-    printf '%s  %s\n' "$UPSTREAM_SHA256" "$TMP_WORK/tcp-brutal.tar.gz" | sha256sum -c -
-    mkdir "$TMP_WORK/module"
-    extract_archive "$TMP_WORK/tcp-brutal.tar.gz" "$TMP_WORK/module"
-    (cd "$TMP_WORK/module" && PACKAGE_VERSION="$DKMS_VERSION" bash scripts/mkdkmsconf.sh > dkms.conf)
-    printf '%s\n' "$UPSTREAM_COMMIT" > "$TMP_WORK/module/.brutal-watch-upstream"
+    [[ -f "$TMP_WORK/module/dkms.conf" && $(cat "$TMP_WORK/module/.brutal-watch-upstream" 2>/dev/null) == "$UPSTREAM_COMMIT" ]] \
+      || die '缺少预检阶段准备的模块源码，请重新运行安装器'
     mv "$TMP_WORK/module" "$source"
   fi
   [[ $(cat "$source/.brutal-watch-upstream" 2>/dev/null) == "$UPSTREAM_COMMIT" ]] || die '源码目录已有未知内容，拒绝覆盖'
   install -d -m 755 "$LIBEXEC"
   install -m 755 "$SOURCE_DIR/scripts/module-build.sh" "$LIBEXEC/module-build"
-  override="/etc/dkms/$MODULE_NAME-$DKMS_VERSION.conf"
-  if [[ -e "$override" ]] && ! grep -q '^# Managed by brutal-watch$' "$override"; then
-    die '发现外部 DKMS 覆盖配置，拒绝覆盖'
-  fi
   cat > "$override" <<EOF
 # Managed by brutal-watch
 MAKE[0]="$LIBEXEC/module-build $COMPILER \${kernel_source_dir}"
 EOF
   dkms status -m "$MODULE_NAME" -v "$DKMS_VERSION" | grep -q . || dkms add -m "$MODULE_NAME" -v "$DKMS_VERSION"
   dkms build -m "$MODULE_NAME" -v "$DKMS_VERSION" -k "$kernel" -j 2
-  dkms install -m "$MODULE_NAME" -v "$DKMS_VERSION" -k "$kernel"
   make -C "$source/tools"
+  dkms install -m "$MODULE_NAME" -v "$DKMS_VERSION" -k "$kernel"
   install -m 755 "$source/tools/brutalctl" /usr/local/bin/brutalctl
   depmod -a "$kernel"
-  modprobe brutal
-  [[ -e /proc/net/tcp_brutal/rules ]] || die '模块加载后未提供 v2 规则接口，请检查模块签名和内核日志'
+  verify_module_version
 }
 
 install_tool() {
   install -d -m 700 /etc/brutal-watch /var/lib/brutal-watch
   install -d -m 755 "$LIBEXEC"
   install -m 755 "$SOURCE_DIR/scripts/module-build.sh" "$LIBEXEC/module-build"
-  install -m 755 "$SOURCE_DIR/brutal_watch.py" /usr/local/sbin/brutal-watch
+  install -m 755 "$SOURCE_DIR/brutal_watch.py" "$WATCH_COMMAND"
   install -m 644 "$SOURCE_DIR/brutal-watch.service" /etc/systemd/system/brutal-watch.service
   install -m 644 "$SOURCE_DIR/brutal-watch.timer" /etc/systemd/system/brutal-watch.timer
   install -m 600 "$SOURCE_DIR/OPERATIONS.md" /etc/brutal-watch/OPERATIONS.md
@@ -288,12 +362,57 @@ install_tool() {
   systemd-analyze verify /etc/systemd/system/brutal-watch.service /etc/systemd/system/brutal-watch.timer
 }
 
-acquire_locks() {
+acquire_install_lock() {
   command -v flock >/dev/null || die '缺少 flock（util-linux）'
   exec 9>/run/brutal-watch-install.lock
   flock -n 9 || die '已有安装任务正在运行'
+}
+
+stop_existing_watch() {
+  local remaining result previous=-1 report="$TMP_WORK/off-status.json"
+  if [[ -x "$WATCH_COMMAND" ]]; then
+    echo '检测到已有 brutal-watch，自动关闭加速并清理本工具规则与路由'
+    while :; do
+      result=0
+      "$WATCH_COMMAND" off > "$report" || result=$?
+      remaining=$(python3 - "$report" "$result" <<'PY'
+import json, sys
+with open(sys.argv[1]) as stream:
+    state = json.load(stream)
+entries = state['entries']
+if state['enabled'] is not False or not isinstance(entries, dict) or state['error']:
+    raise SystemExit('关闭状态或规则清理异常')
+entry_errors = any(e['error'] for e in entries.values())
+if int(sys.argv[2]) != 0 and not (int(sys.argv[2]) == 1 and entry_errors):
+    raise SystemExit('关闭命令异常退出，无法确认清理结果')
+print(len(entries))
+PY
+      ) || {
+        cat "$report" >&2
+        die '无法确认关闭状态，保留原工具及清理重试机制，请检查状态后重试安装'
+      }
+      [[ "$remaining" =~ ^[0-9]+$ ]] || die '关闭状态中的待清理数量无效'
+      ((remaining > 0)) || break
+      if ((previous >= 0 && remaining >= previous)); then
+        cat "$report" >&2
+        die '规则清理没有进展，保留原工具及清理重试机制，请检查状态后重试安装'
+      fi
+      echo "仍有 $remaining 条记录待清理，继续自动清理"
+      previous=$remaining
+    done
+    # off requests a nonblocking timer stop. Drain systemd jobs before taking
+    # the runtime lock, otherwise a pending tick could wait on our own lock.
+    systemctl stop brutal-watch.timer brutal-watch.service \
+      || die '无法停止 watcher 定时器或任务，尚未覆盖工具或模块'
+  fi
+  if systemctl is-active --quiet brutal-watch.timer || systemctl is-active --quiet brutal-watch.service; then
+    die 'watcher 仍在运行，自动停止未完成（请检查已安装命令和 systemd 状态）；尚未覆盖工具或模块'
+  fi
+}
+
+acquire_runtime_lock() {
   exec 8>/run/brutal-watch.lock
-  flock -n 8 || die 'brutal-watch 正在处理任务，请稍后安装'
+  flock -n 8 || die '关闭后仍有其他 brutal-watch 命令占用运行锁，请稍后重试安装'
 }
 
 release_runtime_lock() { flock -u 8; exec 8>&-; }
@@ -301,30 +420,33 @@ release_runtime_lock() { flock -u 8; exec 8>&-; }
 main() {
   parse_args "$@"
   check_platform
-  acquire_locks
+  acquire_install_lock
   trap cleanup EXIT
   umask 077
   TMP_WORK=$(mktemp -d /tmp/brutal-watch-install.XXXXXXXX)
   check_docker
   install_dependencies
   project_source
-  python3 "$SOURCE_DIR/scripts/setup.py" idle
-  python3 "$SOURCE_DIR/scripts/setup.py" config ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"}
   if [[ "$CONFIGURE_NODE" == 1 ]]; then
-    prepare_module
-    install_tool
-    python3 "$SOURCE_DIR/scripts/setup.py" configure-node
+    python3 "$SOURCE_DIR/scripts/setup.py" validate-config ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"}
   else
-    python3 "$SOURCE_DIR/scripts/setup.py" verify-node || die '节点未通过普通 TCP 检查；尚未准备模块或更新工具。可显式使用 --configure-node 或按文档手动调整'
-    prepare_module
-    install_tool
+    python3 "$SOURCE_DIR/scripts/setup.py" verify-node ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"} || die '节点未通过普通 TCP 检查；尚未准备模块或更新工具。可显式使用 --configure-node 或按文档手动调整'
+  fi
+  prepare_module
+  stop_existing_watch
+  acquire_runtime_lock
+  python3 "$SOURCE_DIR/scripts/setup.py" idle || die '关闭后仍有待清理状态，尚未覆盖工具或模块；请处理清理错误后重新安装'
+  python3 "$SOURCE_DIR/scripts/setup.py" config ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"}
+  install_tool
+  if [[ "$CONFIGURE_NODE" == 1 ]]; then
+    python3 "$SOURCE_DIR/scripts/setup.py" configure-node
   fi
   install_module
   python3 "$SOURCE_DIR/scripts/setup.py" resolve-mptcp-block
   release_runtime_lock
-  brutal-watch check
+  "$WATCH_COMMAND" check
   if [[ "$ENABLE" == 1 ]]; then
-    brutal-watch on
+    "$WATCH_COMMAND" on
   else
     echo '安装和检查完成，加速保持关闭。执行 brutal-watch on 开启。'
   fi

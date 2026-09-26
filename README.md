@@ -27,9 +27,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/shigalin/brutal-watch/main/i
   --container xboard-node --ports 2053
 ```
 
-安装前未通过普通 TCP 检查会停止，不会硬开加速。使用现有 v2 模块时可加 `--skip-module`。
+安装前未通过普通 TCP 检查会停止，不会硬开加速。默认将旧 v2 模块升级到项目固定的最新官方稳定版（当前 **v2.0.1**），版本相同则跳过重编译；只有显式传入 `--skip-module` 才保留现有 v2 模块。目标版本随本项目更新，不在安装时动态追踪上游未核验的发布。
 
-未传 `--configure-node` 时，先验证现有节点，再准备模块所需的 headers、DKMS 和编译工具链；只有显式调整节点时，才在重建容器前准备这些依赖。
+安装器先只读校验有效配置（首次安装使用本次参数，已有配置不覆盖）。未传 `--configure-node` 时，再验证现有节点的普通 TCP 监听；随后准备模块所需的 headers、DKMS 和编译工具链，以上完成后才关闭已有加速。配置写入及显式授权的节点重建仍在关闭、清理并取得运行锁后执行。
 
 也可从仓库安装：
 
@@ -39,7 +39,7 @@ cd brutal-watch
 bash install.sh --container xboard-node --ports 2053 --configure-node --enable
 ```
 
-安装其他分支或固定提交时，设置 `BRUTAL_WATCH_REF`，并从同一 ref 下载入口脚本。已有配置不会被安装参数覆盖；更新前执行 `brutal-watch off`，保留 `/etc/brutal-watch/config.json` 和 `/var/lib/brutal-watch/state.json`。
+安装其他分支或固定提交时，设置 `BRUTAL_WATCH_REF`，并从同一 ref 下载入口脚本。已有配置不会被安装参数覆盖；重复安装会自动执行 `brutal-watch off` 并确认规则清理完成，保留 `/etc/brutal-watch/config.json` 和状态文件及其正常清理流程。
 
 ## 使用
 
@@ -182,23 +182,39 @@ systemctl status brutal-watch.timer --no-pager
 | 现象 | 处理方法 |
 | --- | --- |
 | 提示端口未就绪或不是目标进程监听 | 核对容器名、`host` 网络模式和节点端口，等待节点完成启动 |
-| 提示协议为 262 / MPTCP | 先 `off` 并确认清理完成，再使用安装器的 `--configure-node`；显式开启 `tcp_multi_path` 的配置需先手动处理 |
+| 提示协议为 262 / MPTCP | 使用安装器的 `--configure-node`，安装器会先自动关闭加速并清理；显式开启 `tcp_multi_path` 的配置需先手动处理 |
 | 提示模块未加载 | 已安装匹配模块时可执行 `modprobe brutal`，然后 `brutal-watch check`；缺模块则重新运行安装器 |
 | 提示规则或路由冲突 | 不要删除其他程序的规则；核对错误中的 IP 及现有配置，处理冲突后再检查 |
 | 关闭后 `shutdown_pending: true`、连接数为 `null` | 表示存量连接是否完全退出尚不确定，不等于定时器仍在添加规则；检查 `enabled`、定时器和 `entries` |
 | 提示内核 Oops 或无法安全检查 socket | 停止开启操作，先恢复主机或处理权限；不要反复重试、删除故障标记或强卸载模块 |
 
-### 更新本工具
+### 更新工具和内核模块
 
-先 `brutal-watch off`，确认规则清理完成，再重新运行安装入口：
+直接重新运行安装入口，不需要先手动停止：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/shigalin/brutal-watch/main/install.sh)
-brutal-watch check
-brutal-watch on
 ```
 
-更新会保留已有配置和状态，不自动拉取节点新镜像。已经验证为普通 TCP 的节点无需再次传 `--configure-node`。更新节点容器本身时，也应先关闭加速，并保留 `GODEBUG=multipathtcp=0`，重新验证后再开启。
+安装器完成配置、节点和模块状态预检，并准备好源码及编译依赖后，会调用固定路径 `/usr/local/sbin/brutal-watch off`；记录较多时自动分批继续清理，直到本工具规则与路由清理完成，再等待定时器和任务停止、取得运行锁并更新文件。不会停止节点容器或强断存量连接。残留条目含旧错误、导致 `off` 返回 1 时，只要后续批次的剩余数量持续下降，就继续清理；顶层错误（如 timer 操作失败）、异常退出、数量不下降或状态无法确认时中断，中止时会输出本轮清理报告，不覆盖工具和模块，保留原有清理重试机制。
+
+若磁盘已是目标版本、内存仍为旧版，预检会在 `off` 前提示待重启并退出，保持当前加速状态。需要构建时，已有源码归属、外部 DKMS 覆盖配置检查及上游归档下载、SHA256 校验、解包均在 `off` 前完成；新源码暂存于临时目录，正式写入、编译和 DKMS 安装仍在关闭后执行，写入前再次检查归属。
+
+重复安装默认更新工具，并将此前安装的旧 v2 模块升级至当前目标版本；包括本项目的 `2.0.0-bw644db52`、官方 DKMS 或手工安装的 v2.0.0。需要升级时使用本项目的 DKMS 构建入口，不强制覆盖 DKMS 拒绝替换的模块，不自动删除旧源码或旧 DKMS 注册。已有比目标更新的版本、v1 或无法识别的版本会停止，避免降级或错误迁移。安装成功后默认保持关闭；希望检查通过后自动开启，可在安装命令后加 `--enable`。
+
+**`off` 不会卸载旧模块。** 新版安装到磁盘后，如果 `/sys/module/brutal/version` 仍为旧版，安装器会以非零状态退出并明确提示“升级尚未生效”，即使传入 `--enable` 也不会开启加速。此时请安排维护窗口手动重启主机（会中断连接），重启后重新运行上面的安装命令验证；不会重复编译已经安装的目标版本。安装器不会自动重启、强卸载模块或断开现有连接。这里的版本一致性限制属于安装器；独立的 `brutal-watch check/on` 只检查规则接口等运行条件，不校验磁盘与加载版本，不能把它们通过视为模块升级已生效。
+
+确认安装器成功结束后，再执行：
+
+```bash
+modinfo -F version brutal       # 当前内核在磁盘上的模块版本
+cat /sys/module/brutal/version # 当前实际加载版本；本次升级两者应均为 2.0.1
+brutal-watch check && brutal-watch on
+```
+
+仅更新工具而保留旧模块时，加 `--skip-module`；但磁盘和已加载版本不一致时仍会停止，不能用它绕过待重启状态。编译或 DKMS 安装失败时保持加速关闭，修复错误后重跑安装器；若磁盘仍解析到旧版本，核查 `dkms status` 和 `modinfo -n brutal`，不要强制覆盖或手动删除未知模块。
+
+更新会保留已有配置和状态，不自动拉取节点新镜像。已经验证为普通 TCP 的节点无需再次传 `--configure-node`。更新节点容器本身时，也应先关闭加速，并保留 `GODEBUG=multipathtcp=0`，重新验证后再开启。旧 DKMS 记录可能仍用于其他已安装内核，本安装器只升级当前运行内核；其他内核需在切换后检查并重新运行安装器。
 
 完整安装参数见 `bash install.sh --help`；内核模块的升级与重编译边界见下文。
 
@@ -208,6 +224,7 @@ brutal-watch on
 | --- | --- |
 | 宿主机 GCC 10、内核由 GCC 13 编译 | 读取内核配置，优先用匹配 GCC；没有则用官方 GCC 容器编译，不取消内核安全编译选项 |
 | Clang 构建的内核 | `auto` / `native` 安装本机 clang、lld、llvm，沿用上游 `LLVM=1` 构建；`docker` 目前仅支持 GCC |
+| XanMod 等带 BBRv3 补丁的内核 | 使用官方 v2.0.1 对 `tso_segs` / `min_tso_segs` 的自动检测，不维护本地内核补丁 |
 | Debian 官方旧内核的 headers 已退出当前源 | 先使用当前 APT 源；没有候选包时，按已安装内核包的精确版本查找 Debian Snapshot。通过临时隔离的 APT 索引和系统 `debian-archive-keyring` 验证 Release/Packages，再用已认证包记录中的 SHA256 校验下载文件，核对包名称、版本、架构和源码来源并模拟安装；需要删除或替换已有包、安装内核或相关系统服务时停止 |
 | 定制内核或无法确认来源的内核缺 headers | 在调整节点前停止，提示准备提供方的匹配 headers；不会猜测版本、替换内核或重启服务器 |
 | `latin-1` 等输出编码不能打印中文 | 命令行工具及安装辅助程序使用 UTF-8 输出，不修改宿主机 locale |
@@ -228,9 +245,9 @@ brutal-watch on
 
 自动化部署可显式传入 `--archive-wait-minutes N`（1–30 的整数），预先授权本次归档查找、下载的总等待分钟数。例如 `--archive-wait-minutes 30` 允许无终端执行最多等待 30 分钟；到达所选上限直接停止，不再询问。这是仅对本次运行生效的参数，不写入节点或 watcher 配置。不传此参数时仍保留上述两分钟确认规则。
 
-已有匹配 headers、已加载或磁盘上可用的 v2 模块继续复用。Ubuntu 继续使用现有软件源，缺少精确 headers 时停止。不会改装最新内核来绕过失败。
+已有匹配 headers 继续复用；模块默认升级到项目目标版本，同版本或显式 `--skip-module` 才复用。Ubuntu 继续使用现有软件源，缺少精确 headers 时停止。不会改装最新内核来绕过失败。
 
-**复用此前手工安装的 v2 模块不会自动将其转换为 DKMS 安装**，原来的内核升级维护方式仍适用。
+**同版本或 `--skip-module` 复用此前手工安装的 v2 模块，不会将其转换为 DKMS 安装**；默认升级旧版本则通过 DKMS 安装新版。已有外部升级任务仍需由管理员协调，避免多个安装器同时管理同一模块。
 
 自动编译支持 GCC 和 Clang 构建的内核。Clang 使用发行版提供的 LLVM 工具链；若定制内核要求其他工具链版本，仍需自行准备兼容版本。DKMS 后续重建也需要对应工具链可用。受限环境若禁止 root 通过 `pidfd_getfd` 检查目标进程 socket，会拒绝开启，不降低协议验证要求。
 

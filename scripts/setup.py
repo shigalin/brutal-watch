@@ -129,7 +129,7 @@ def ensure_idle():
         raise ValueError('定时器仍活动，请先关闭')
 
 
-def write_config(args):
+def write_config(args, dry_run=False):
     path = watch.CONFIG
     if path.exists():
         # Reinstallation must not overwrite working user configuration.
@@ -143,6 +143,8 @@ def write_config(args):
         value = getattr(args, key, None)
         if value is not None: cfg[key] = value
     watch.validate_config(cfg)
+    if dry_run:
+        return cfg
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_text(path, json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
     return watch.config_load(path)
@@ -259,7 +261,7 @@ def resolve_mptcp_block(cfg):
 def main():
     watch.configure_output()
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['idle', 'config', 'configure-node', 'verify-node', 'resolve-mptcp-block'])
+    parser.add_argument('action', choices=['idle', 'config', 'validate-config', 'configure-node', 'verify-node', 'resolve-mptcp-block'])
     parser.add_argument('--container')
     parser.add_argument('--ports', type=lambda s: [int(x) for x in s.split(',')])
     parser.add_argument('--rate-mbps', type=int)
@@ -271,8 +273,10 @@ def main():
             ensure_idle()
         elif args.action == 'config':
             write_config(args)
+        elif args.action == 'validate-config':
+            write_config(args, dry_run=True)
         else:
-            cfg = watch.config_load(watch.CONFIG)
+            cfg = write_config(args, dry_run=True) if args.action == 'verify-node' else watch.config_load(watch.CONFIG)
             if args.action == 'configure-node': configure_node(cfg)
             if args.action == 'resolve-mptcp-block': resolve_mptcp_block(cfg)
             peers = watch.Host().peers(cfg)
