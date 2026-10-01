@@ -111,8 +111,14 @@ class RecoveryTests(unittest.TestCase):
             elif args[:2] == ['dpkg', '--compare-versions']:
                 code = int(args[2] != args[4])
             elif args[0] == 'dpkg-query':
-                info = state.get(args[-1])
-                output, code = ('installed\t' + '\t'.join(info), 0) if info else ('', 1)
+                if len(args) == 3:
+                    output = ''.join('installed\t{}\t{}\t{}\n'.format(name, info[1], info[0])
+                                     for name, info in state.items())
+                else:
+                    info = state.get(args[-1])
+                    output, code = ('installed\t' + '\t'.join(info), 0) if info else ('', 1)
+            elif args[0] == 'apt-config':
+                output = ''
             elif args[0] == 'apt-cache':
                 if 'show' in args:
                     if record_result and self.index_calls == 1:
@@ -277,6 +283,67 @@ class RecoveryTests(unittest.TestCase):
                         self.assertFalse(any(call[0] == 'dpkg-deb' for call in self.calls))
                     if flag in ('bad_signature', 'missing_keyring'):
                         self.assertFalse(any(call[0] == 'curl' for call in self.calls))
+
+
+class PreservedVersionTests(unittest.TestCase):
+    def test_preferences_keep_installed_versions_and_existing_policy(self):
+        status = ('installed\tlinux-libc-dev\tamd64\t6.1.180-1\n'
+                  'installed\tforeign-library\tarm64\t1:2.0-1\n'
+                  'installed\tshared-data\tall\t1.0\n'
+                  'config-files\tremoved-package\tamd64\t1.0\n')
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            existing = root / 'existing preferences'
+            policy = 'Package: blocked-package\nPin: version *\nPin-Priority: -1\n'
+            existing.write_text(policy)
+            results = [subprocess.CompletedProcess([], 0, status, ''),
+                       subprocess.CompletedProcess([], 0, "preferences='{}'\n".format(existing), '')]
+            with patch.object(headers, 'run', side_effect=results):
+                options = headers.preserve_installed_options(root)
+            self.assertEqual(options, ['-o', 'Dir::Etc::preferences=' + str(root / 'preserve-installed.pref')])
+            content = (root / 'preserve-installed.pref').read_text()
+            for name, version in (('linux-libc-dev:amd64', '6.1.180-1'),
+                                  ('foreign-library:arm64', '1:2.0-1'), ('shared-data', '1.0')):
+                keep = 'Package: {}\nPin: version {}\nPin-Priority: 1001\n'.format(name, version)
+                block = 'Package: {}\nPin: version *\nPin-Priority: -1\n'.format(name)
+                self.assertIn(keep, content)
+                self.assertIn(block, content)
+                self.assertLess(content.index(keep), content.index(block))
+            self.assertNotIn('removed-package', content)
+            self.assertTrue(content.endswith(policy))
+            self.assertEqual(existing.read_text(), policy)
+
+    def test_install_uses_same_constraints_and_stops_on_conflict(self):
+        options = ['-o', 'Dir::Etc::preferences=/tmp/preserve-installed.pref']
+        for conflict in (False, True):
+            with self.subTest(conflict=conflict):
+                recovery = object.__new__(headers.Recovery)
+                recovery.directory = Path('/tmp')
+                recovery.paths = ['/tmp/exact-headers.deb']
+                recovery.packages = {HEADER: VERSION}
+                output = ('E: dependency requires linux-libc-dev (>= 6.1.187-1)\n'
+                          'https://user:secret@example.invalid/repo' if conflict else
+                          'Inst {} ({} local-deb [amd64])\n'.format(HEADER, VERSION))
+                plan = subprocess.CompletedProcess([], 100 if conflict else 0, output, '')
+                installed_state = iter([None, [VERSION, 'amd64', 'linux']])
+                with patch.object(headers, 'preserve_installed_options', return_value=options), \
+                     patch.object(headers, 'run', return_value=plan) as run, \
+                     patch.object(headers, 'installed', side_effect=lambda name: next(installed_state)), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error:
+                    if conflict:
+                        with self.assertRaisesRegex(headers.HeaderError, '保留已安装软件包版本'):
+                            recovery.install()
+                        self.assertEqual(run.call_count, 1)
+                        self.assertIn('linux-libc-dev (>= 6.1.187-1)', error.getvalue())
+                        self.assertNotIn('user:secret', error.getvalue())
+                    else:
+                        recovery.install()
+                        simulate, actual = [call.args[0] for call in run.call_args_list]
+                        self.assertEqual([arg for arg in simulate if arg != '-s'],
+                                         [arg for arg in actual if arg != '-y'])
+                    args = run.call_args_list[0].args[0]
+                    self.assertIn(options[1], args)
+                    self.assertIn('--no-remove', args)
 
 
 class ConfirmationTests(unittest.TestCase):

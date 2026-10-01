@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -181,6 +182,37 @@ def validate_plan(output, packages):
         if planned.get(name) != version:
             raise HeaderError('headers 安装计划未采用已校验的精确包版本，已停止')
     return planned
+
+
+def preserve_installed_options(directory):
+    """Constrain this transaction without changing global pins or auto/manual marks."""
+    status = run(['dpkg-query', '-W', '-f=${db:Status-Status}\t${Package}\t${Architecture}\t${Version}\n'])
+    records = []
+    for line in status.stdout.splitlines():
+        fields = line.split('\t')
+        if not fields or fields[0] != 'installed':
+            continue
+        if (len(fields) != 4 or not re.fullmatch(r'[a-z0-9][a-z0-9+.-]+', fields[1]) or
+                not re.fullmatch(r'[a-z0-9][a-z0-9-]*', fields[2]) or
+                not re.fullmatch(r'[0-9][a-zA-Z0-9.+:~\-]*', fields[3])):
+            raise HeaderError('无法读取已安装软件包的精确版本，已停止')
+        _, name, arch, version = fields
+        name = name if arch == 'all' else name + ':' + arch
+        # First matching specific pin wins; retain this version and forbid others.
+        records.append('Package: {}\nPin: version {}\nPin-Priority: 1001\n\n'
+                       'Package: {}\nPin: version *\nPin-Priority: -1\n\n'.format(name, version, name))
+    # Keep the configured main preference file after our transaction-only pins.
+    # The configured preferences.d directory remains in use, unchanged.
+    configured = shlex.split(run(['apt-config', 'shell', 'preferences', 'Dir::Etc::preferences/f']).stdout)
+    if configured:
+        if len(configured) != 1 or not configured[0].startswith('preferences='):
+            raise HeaderError('无法确定现有 APT 版本偏好配置，已停止')
+        path = Path(configured[0].split('=', 1)[1])
+        if path.is_file():
+            records.append(path.read_text(encoding='utf-8'))
+    preferences = directory / 'preserve-installed.pref'
+    preferences.write_text(''.join(records), encoding='utf-8')
+    return ['-o', 'Dir::Etc::preferences=' + str(preferences)]
 
 
 class Recovery:
@@ -404,8 +436,12 @@ class Recovery:
             queue.extend(build_dependencies(control['Depends'] + ',' + control['Pre-Depends']))
 
     def install(self):
-        args = ['apt-get', '--no-remove', '--no-install-recommends', 'install'] + self.paths
-        plan = run(args[:1] + ['-s'] + args[1:])
+        options = preserve_installed_options(self.directory)
+        args = ['apt-get'] + options + ['--no-remove', '--no-install-recommends', 'install'] + self.paths
+        plan = run(args[:1] + ['-s'] + args[1:], optional=True)
+        if plan.returncode:
+            print(redact_output(plan.stdout + plan.stderr), file=sys.stderr)
+            raise HeaderError('保留已安装软件包版本时无法生成 headers 安装计划，已停止；请检查上面的 APT 错误或依赖冲突详情')
         additions = validate_plan(plan.stdout, self.packages)
         # Check dpkg as well as APT's printed plan, including same-version reinstalls.
         if any(installed(name) for name in additions):
