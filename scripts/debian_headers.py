@@ -165,8 +165,12 @@ def validate_plan(output, packages):
         if not line.startswith('Inst '):
             continue
         match = re.match(r'^Inst (\S+)(?: \[([^]]+)\])? \((\S+)', line)
-        if not match or match[2]:
-            raise HeaderError('headers 安装计划需要替换已有软件包，已停止')
+        if not match:
+            raise HeaderError('无法解析 headers 安装计划，已停止；APT 行：' + redact_output(line))
+        if match[2]:
+            raise HeaderError(redact_output(
+                'headers 安装计划需要替换已有软件包，已停止；包名 {}，已安装版本 {}，目标版本 {}'.format(
+                    match[1], match[2], match[3])))
         name = match[1].split(':')[0]
         if name.startswith(('linux-image', 'grub', 'systemd', 'docker')):
             raise HeaderError('headers 安装计划涉及内核或系统服务，已停止')

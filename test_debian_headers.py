@@ -38,6 +38,27 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(headers.HeaderError):
             headers.validate_plan('Inst {} (999 Debian [amd64])'.format(HEADER), {HEADER: VERSION})
 
+    def test_replacement_error_identifies_package_and_versions(self):
+        for old, new in (('1.0', '2.0'), ('2.0', '1.0')):
+            with self.subTest(old=old, new=new):
+                with self.assertRaises(headers.HeaderError) as error:
+                    headers.validate_plan('Inst libelf1:amd64 [{}] ({} Debian [amd64])'.format(old, new), {})
+                self.assertIn('需要替换已有软件包', str(error.exception))
+                self.assertIn('libelf1:amd64', str(error.exception))
+                self.assertIn('已安装版本 {}'.format(old), str(error.exception))
+                self.assertIn('目标版本 {}'.format(new), str(error.exception))
+
+    def test_unparseable_plan_reports_redacted_line_separately(self):
+        line = 'Inst unknown-package unexpected https://user:secret@example.invalid/repo'
+        with self.assertRaises(headers.HeaderError) as error:
+            headers.validate_plan(line, {})
+        message = str(error.exception)
+        self.assertIn('无法解析 headers 安装计划', message)
+        self.assertIn('Inst unknown-package unexpected <repository-url>', message)
+        self.assertNotIn('替换已有软件包', message)
+        self.assertNotIn('user:secret', message)
+        self.assertNotIn('example.invalid', message)
+
     def test_legacy_build_dependencies_and_unknown_expressions(self):
         depends = 'linux-headers-5.10.0-34-common (= 5.10.234-1), linux-kbuild-5.10 (>= 5.10.234-1), linux-compiler-gcc-10-x86, linux-base'
         self.assertEqual(len(list(headers.build_dependencies(depends))), 3)
