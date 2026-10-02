@@ -251,7 +251,7 @@ class UninstallTests(unittest.TestCase):
                      patch.object(uninstall.subprocess, 'run', side_effect=busy), \
                      patch.object(uninstall.time, 'monotonic', side_effect=lambda: next(clock)):
                     if failure == 'unload':
-                        with self.assertRaisesRegex(ValueError, '仍被占用'):
+                        with self.assertRaisesRegex(ValueError, '仍无法卸载'):
                             with uninstall.unload_module():
                                 self.fail('module never unloaded')
                     elif failure == 'body':
@@ -270,6 +270,56 @@ class UninstallTests(unittest.TestCase):
                 self.assertIn(['docker', 'stop', '--time', '30', 'my-node'], self.actions)
                 self.assertIn(['docker', 'start', 'my-node'], self.actions)
                 self.assertNotIn(['rmmod', '-f', 'brutal'], self.actions)
+
+    def test_stopped_node_waits_for_unload_and_stays_stopped(self):
+        for failure in ('none', 'unload', 'body'):
+            with self.subTest(failure=failure):
+                self.actions.clear()
+                self.load()
+                attempts = []
+                def busy(argv, **kwargs):
+                    self.actions.append(argv)
+                    self.assertEqual(argv, ['rmmod', 'brutal'])
+                    attempts.append(argv)
+                    if len(attempts) <= 2 or failure == 'unload':
+                        return subprocess.CompletedProcess(argv, 1, stderr='Module brutal is in use')
+                    shutil.rmtree(uninstall.LOADED)
+                    return subprocess.CompletedProcess(argv, 0)
+                clock = iter(range(0, 1000, 10))
+                with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node'}), \
+                     patch.object(uninstall.subprocess, 'check_output', return_value='false\n'), \
+                     patch.object(uninstall.subprocess, 'run', side_effect=busy), \
+                     patch.object(uninstall.time, 'monotonic', side_effect=lambda: next(clock)), \
+                     patch.object(uninstall.time, 'sleep') as sleep:
+                    if failure == 'unload':
+                        with self.assertRaisesRegex(ValueError, 'Module brutal is in use') as error:
+                            with uninstall.unload_module():
+                                self.fail('module never unloaded')
+                        self.assertNotIn('已恢复节点', str(error.exception))
+                        self.assertTrue(uninstall.LOADED.exists())
+                    elif failure == 'body':
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            with uninstall.unload_module():
+                                raise subprocess.CalledProcessError(1, ['dkms', 'remove'])
+                    else:
+                        with uninstall.unload_module():
+                            self.assertFalse(uninstall.LOADED.exists())
+                    self.assertTrue(sleep.called)
+                self.assertGreater(len(attempts), 1)
+                self.assertFalse(any(a[0] == 'docker' for a in self.actions))
+
+    def test_unload_failure_preserves_rmmod_error(self):
+        self.load()
+        clock = iter(range(0, 1000, 10))
+        with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node'}), \
+             patch.object(uninstall.subprocess, 'check_output', return_value='false\n'), \
+             patch.object(uninstall.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                 ['rmmod', 'brutal'], 1, stderr='rmmod: ERROR: Operation not permitted')) as run, \
+             patch.object(uninstall.time, 'monotonic', side_effect=lambda: next(clock)):
+            with self.assertRaisesRegex(ValueError, 'Operation not permitted'):
+                with uninstall.unload_module():
+                    self.fail('module never unloaded')
+            self.assertEqual(run.call_args.kwargs['stderr'], subprocess.PIPE)
 
 
 class UninstallEntryTests(unittest.TestCase):

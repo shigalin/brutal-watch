@@ -34,7 +34,7 @@
 
 安装命令和平台要求见 [README](README.md)。默认安装会自动补齐缺少的依赖、验证普通 TCP 监听、安装或升级官方 v2 模块，同版本不重编译；`--skip-module` 才保留旧 v2 模块。不自动改变节点配置或开启加速。`--configure-node` 和 `--enable` 分别明确授权这两项操作。
 
-切换其他加速可执行 `bash install.sh --uninstall --unload-module`，完整入口及退出码见 [一键卸载](README.md#一键卸载)。该参数允许卸载当前已加载的 `brutal` 模块（包括外部安装的模块）；被占用时，会停止配置中的目标容器，中断连接，移除模块后恢复容器。磁盘上仍只删除有项目归属标记的安装。未传 `--unload-module` 且模块仍加载时，关闭加速并保留整个安装，返回 2，不凭版本号推断来源。`--keep-module` 仅卸载 watcher，保留模块及其构建入口。卸载不修改 Compose 或系统默认拥塞算法。
+切换其他加速可执行 `bash install.sh --uninstall --unload-module`，完整入口及退出码见 [一键卸载](README.md#一键卸载)。该参数允许卸载当前已加载的 `brutal` 模块（包括外部安装的模块）；首次卸载未成功时，会停止仍在运行的目标容器并中断连接，等待最多 60 秒重试，移除模块及项目 DKMS 安装后恢复容器，失败时也尝试恢复。原本已停止的容器同样等待重试，但保持停止状态；超时显示 `rmmod` 实际错误。磁盘上仍只删除有项目归属标记的安装。未传 `--unload-module` 且模块仍加载时，关闭加速并保留整个安装，返回 2，不凭版本号推断来源。`--keep-module` 仅卸载 watcher，保留模块及其构建入口。卸载不修改 Compose 或系统默认拥塞算法。
 
 DKMS 包名是 `tcp-brutal`，实际内核模块名是 `brutal`。当前固定官方 v2.0.1（提交 `d2397ff8bca04a29fd2de01cf7d2d4b825224de8`，下载归档校验 SHA256）；目标版本随本项目更新，不动态追踪上游发布。新安装的源码及 DKMS 构建配置保存在 `/usr/src/tcp-brutal-2.0.1-bwd2397ff`、`/etc/dkms/tcp-brutal-2.0.1-bwd2397ff.conf`，构建入口为 `/usr/local/libexec/brutal-watch/module-build`。旧 v2 默认升级，同版本或 `--skip-module` 复用手工安装时不转换为 DKMS。
 

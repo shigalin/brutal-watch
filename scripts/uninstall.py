@@ -102,8 +102,10 @@ def preflight(keep_module):
 
 
 def try_unload():
-    subprocess.run(['rmmod', 'brutal'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return not LOADED.exists()
+    result = subprocess.run(['rmmod', 'brutal'], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True)
+    error = watch.short_error((result.stderr or '').strip())
+    return not LOADED.exists(), error or 'rmmod 退出码 {}，模块仍在内存中'.format(result.returncode)
 
 
 def start_node(container):
@@ -118,40 +120,54 @@ def start_node(container):
 
 @contextlib.contextmanager
 def unload_module():
-    if not LOADED.exists() or try_unload():
+    if not LOADED.exists():
+        yield
+        return
+    unloaded, error = try_unload()
+    if unloaded:
         yield
         return
     # Only stop the configured node; never kill arbitrary processes or force rmmod.
     try:
         cfg = watch.config_load(CONFIG / 'config.json')
     except FileNotFoundError as exc:
-        raise ValueError('模块仍被占用，但配置文件已不存在，无法确定目标容器。'
-                         '请手动停止占用模块的服务后重试。') from exc
+        raise ValueError('模块未能卸载，且配置文件已不存在，无法确定目标容器。'
+                         '请检查后重试。rmmod：' + error) from exc
     container = cfg['container']
     if not shutil.which('docker'):
-        raise ValueError('模块仍被占用且缺少 docker，无法停止目标节点')
+        raise ValueError('模块未能卸载且缺少 docker，无法检查目标节点。rmmod：' + error)
     result = subprocess.check_output(['docker', 'inspect', '-f', '{{.State.Running}}', container], text=True)
-    if result.strip() != 'true':
-        raise ValueError('目标节点未运行，模块仍无法卸载；请检查其他使用 TCP Brutal 的进程')
-    print('模块仍被占用，停止节点容器并中断现有连接：' + container, flush=True)
+    if result.strip() not in ('true', 'false'):
+        raise ValueError('无法确认目标节点运行状态，保留节点及模块。rmmod：' + error)
+    was_running = result.strip() == 'true'
+    if was_running:
+        print('模块未能卸载，停止节点容器并中断现有连接：' + container, flush=True)
+    else:
+        print('目标节点已停止，等待模块释放并重试卸载：' + container, flush=True)
     try:
-        run(['docker', 'stop', '--time', '30', container])
+        if was_running:
+            run(['docker', 'stop', '--time', '30', container])
         # Orphaned connections keep the congestion module referenced until they finish closing.
         deadline = time.monotonic() + UNLOAD_WAIT_SECONDS
-        while not try_unload():
+        while True:
+            unloaded, error = try_unload()
+            if unloaded:
+                break
             if time.monotonic() >= deadline:
-                raise ValueError('节点已停止，但 brutal 模块 {} 秒内仍被占用（未关闭完的连接或其他进程），'
-                                 '已恢复节点；请稍后重试'.format(UNLOAD_WAIT_SECONDS))
+                raise ValueError('节点已停止，但 brutal 模块 {} 秒内仍无法卸载。rmmod：{}'.format(
+                    UNLOAD_WAIT_SECONDS, error))
             time.sleep(1)
         yield  # Keep the node stopped until DKMS files are removed too.
     except BaseException as exc:
         # Restore the node even when stop/unload fails after partially succeeding.
-        try:
-            start_node(container)
-        except ValueError as restore_error:
-            raise ValueError(watch.short_error(exc) + '；' + str(restore_error)) from exc
+        if was_running:
+            try:
+                start_node(container)
+            except ValueError as restore_error:
+                raise ValueError(watch.short_error(exc) + '；' + str(restore_error)) from exc
         raise
-    start_node(container)
+    if was_running:
+        start_node(container)
 
 
 def ensure_idle():
