@@ -15,6 +15,10 @@ WATCH_COMMAND=/usr/local/sbin/brutal-watch
 CONFIGURE_NODE=0
 ENABLE=0
 SKIP_MODULE=0
+UNINSTALL=0
+KEEP_MODULE=0
+UNLOAD_MODULE=0
+INSTALL_REQUESTED=0
 COMPILER=auto
 TMP_WORK=
 CONFIG_ARGS=()
@@ -24,6 +28,10 @@ PACKAGE_INDEX_UPDATED=0
 usage() {
   cat <<'EOF'
 用法：bash install.sh [选项]
+      bash install.sh --uninstall [--keep-module | --unload-module]
+  --uninstall          关闭并清理加速，删除工具、配置、状态及本项目安装的 DKMS 模块
+  --keep-module        卸载时保留内核模块、brutalctl 和 DKMS 构建入口
+  --unload-module      允许移除当前已加载的 brutal 模块（包括外部安装的模块），必要时中断目标节点连接
   --container NAME     目标容器（首次安装默认 xboard-node）
   --ports 2053,443      节点监听端口（首次安装默认 2053）
   --rate-mbps 100       每个 IP 的目标速率
@@ -38,6 +46,7 @@ usage() {
 默认安装或升级到项目固定的最新官方稳定版，不调整节点、不启用加速。
 重复安装会自动 off 并确认规则清理完成；内存中旧模块不会强制卸载，升级后可能需要手动重启。
 只支持 Debian/Ubuntu、systemd、x86_64/aarch64、现有 Docker host 网络节点。
+卸载不受上述安装环境限制，但需要 root、Linux 和 systemd；--unload-module 允许在模块占用时停止并恢复目标容器。
 EOF
 }
 die() { echo "错误：$*" >&2; exit 1; }
@@ -52,23 +61,33 @@ parse_args() {
   while (($#)); do
     case "$1" in
       --help|-h) usage; exit 0 ;;
-      --configure-node) CONFIGURE_NODE=1; shift ;;
-      --enable) ENABLE=1; shift ;;
-      --skip-module) SKIP_MODULE=1; shift ;;
+      --uninstall) UNINSTALL=1; shift ;;
+      --keep-module) KEEP_MODULE=1; shift ;;
+      --unload-module) UNLOAD_MODULE=1; shift ;;
+      --configure-node) INSTALL_REQUESTED=1; CONFIGURE_NODE=1; shift ;;
+      --enable) INSTALL_REQUESTED=1; ENABLE=1; shift ;;
+      --skip-module) INSTALL_REQUESTED=1; SKIP_MODULE=1; shift ;;
       --compiler)
+        INSTALL_REQUESTED=1
         (($# >= 2)) || die '--compiler 缺少参数'
         COMPILER=$2; shift 2 ;;
       --archive-wait-minutes)
+        INSTALL_REQUESTED=1
         (($# >= 2)) || die '--archive-wait-minutes 缺少参数'
         [[ "$2" =~ ^([1-9]|[12][0-9]|30)$ ]] || die '--archive-wait-minutes 必须是 1–30 的整数'
         ARCHIVE_ARGS=(--archive-wait-minutes "$2"); shift 2 ;;
       --container|--ports|--rate-mbps|--ttl-seconds|--max-ips)
+        INSTALL_REQUESTED=1
         (($# >= 2)) || die "$1 缺少参数"
         CONFIG_ARGS+=("$1" "$2"); shift 2 ;;
       *) die "未知选项 $1" ;;
     esac
   done
   [[ "$COMPILER" == auto || "$COMPILER" == native || "$COMPILER" == docker ]] || die 'compiler 必须是 auto/native/docker'
+  ((UNINSTALL == 0 || INSTALL_REQUESTED == 0)) || die '--uninstall 不能与安装参数混用'
+  ((KEEP_MODULE == 0 || UNINSTALL == 1)) || die '--keep-module 只能与 --uninstall 一起使用'
+  ((UNLOAD_MODULE == 0 || UNINSTALL == 1)) || die '--unload-module 只能与 --uninstall 一起使用'
+  ((KEEP_MODULE == 0 || UNLOAD_MODULE == 0)) || die '--keep-module 不能与 --unload-module 一起使用'
 }
 
 check_platform() {
@@ -389,13 +408,13 @@ print(len(entries))
 PY
       ) || {
         cat "$report" >&2
-        die '无法确认关闭状态，保留原工具及清理重试机制，请检查状态后重试安装'
+        die '无法确认关闭状态，保留原工具及清理重试机制，请检查状态后重试'
       }
       [[ "$remaining" =~ ^[0-9]+$ ]] || die '关闭状态中的待清理数量无效'
       ((remaining > 0)) || break
       if ((previous >= 0 && remaining >= previous)); then
         cat "$report" >&2
-        die '规则清理没有进展，保留原工具及清理重试机制，请检查状态后重试安装'
+        die '规则清理没有进展，保留原工具及清理重试机制，请检查状态后重试'
       fi
       echo "仍有 $remaining 条记录待清理，继续自动清理"
       previous=$remaining
@@ -403,22 +422,52 @@ PY
     # off requests a nonblocking timer stop. Drain systemd jobs before taking
     # the runtime lock, otherwise a pending tick could wait on our own lock.
     systemctl stop brutal-watch.timer brutal-watch.service \
-      || die '无法停止 watcher 定时器或任务，尚未覆盖工具或模块'
+      || die '无法停止 watcher 定时器或任务，尚未改动工具或模块'
   fi
   if systemctl is-active --quiet brutal-watch.timer || systemctl is-active --quiet brutal-watch.service; then
-    die 'watcher 仍在运行，自动停止未完成（请检查已安装命令和 systemd 状态）；尚未覆盖工具或模块'
+    die 'watcher 仍在运行，自动停止未完成（请检查已安装命令和 systemd 状态）；尚未改动工具或模块'
   fi
 }
 
 acquire_runtime_lock() {
   exec 8>/run/brutal-watch.lock
-  flock -n 8 || die '关闭后仍有其他 brutal-watch 命令占用运行锁，请稍后重试安装'
+  flock -n 8 || die '关闭后仍有其他 brutal-watch 命令占用运行锁，请稍后重试'
 }
 
 release_runtime_lock() { flock -u 8; exec 8>&-; }
 
+check_uninstall_platform() {
+  [[ $(uname -s) == Linux && $(id -u) == 0 && -d /run/systemd/system ]] \
+    || die '请在使用 systemd 的 Linux 宿主机上以 root 卸载'
+  local dependency
+  for dependency in python3 flock systemctl ip; do
+    command -v "$dependency" >/dev/null || die "卸载缺少命令：$dependency"
+  done
+}
+
+uninstall_main() {
+  check_uninstall_platform
+  acquire_install_lock
+  trap cleanup EXIT
+  umask 077
+  TMP_WORK=$(mktemp -d /tmp/brutal-watch-uninstall.XXXXXXXX)
+  project_source
+  local options=()
+  [[ "$KEEP_MODULE" == 0 ]] || options+=(--keep-module)
+  [[ "$UNLOAD_MODULE" == 0 ]] || options+=(--unload-module)
+  python3 "$SOURCE_DIR/scripts/uninstall.py" preflight ${options[@]+"${options[@]}"}
+  stop_existing_watch
+  acquire_runtime_lock
+  python3 "$SOURCE_DIR/scripts/uninstall.py" remove ${options[@]+"${options[@]}"}
+  release_runtime_lock
+}
+
 main() {
   parse_args "$@"
+  if [[ "$UNINSTALL" == 1 ]]; then
+    uninstall_main
+    return
+  fi
   check_platform
   acquire_install_lock
   trap cleanup EXIT

@@ -45,6 +45,8 @@ bash install.sh --container xboard-node --ports 2053 --configure-node --enable
 
 以下命令均在**节点所在的 Linux 宿主机**上以 root 执行，不是在客户端电脑或节点容器内执行。
 
+需要停用并改用其他加速时，直接使用[一键卸载](#一键卸载)，`off` 仅关闭加速，不删除程序或模块。
+
 ### 确认容器和端口
 
 先查看容器名称，再检查网络模式：
@@ -264,6 +266,40 @@ brutal-watch check && brutal-watch on
 - 本工具不会自动修复已发生的内核崩溃、强卸载模块、强杀节点或重启服务器。
 
 详细说明：[运维与状态语义](OPERATIONS.md) · [隔离验证记录](diagnostics/README.md)。
+
+## 一键卸载
+
+在 Linux 宿主机上以 root 执行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/shigalin/brutal-watch/main/install.sh) --uninstall --unload-module
+```
+
+已有仓库也可直接执行 `bash install.sh --uninstall --unload-module`。`--unload-module` 明确允许移除当前内存中的 `brutal` 模块，**包括官方或手工安装的模块**；它不会扩大磁盘文件的删除范围。卸载与安装使用同一互斥锁；不要求匹配内核 headers 或编译工具链，不安装依赖。远程入口仍需下载项目文件。
+
+默认先关闭加速、取消开机自启，分批清理本工具的规则和路由，确认清理完成后删除：
+
+- `brutal-watch` 命令、systemd timer/service、`/etc/brutal-watch` 配置与 `/var/lib/brutal-watch` 状态。需要保留配置时请提前备份。
+- 本项目安装并有归属标记的所有 TCP Brutal DKMS 版本（包括旧版本）、对应源码和 DKMS 配置。
+- 不再被其他 DKMS 配置引用的构建入口，以及与本项目源码目录内已编译文件一致的 `brutalctl`。
+
+**上述命令允许中断连接。** 会先尝试卸载内存中的 `brutal` 模块；若被占用，则停止配置中的目标节点容器，在 60 秒重试窗口内等待未关闭完的连接释放模块，卸载模块并删除 DKMS 安装后再启动容器。中途卸载失败也会尝试恢复该容器，恢复失败时会提示手动启动。其他进程仍占用模块、仍有其他 TCP Brutal 规则、清理失败、状态损坏或文件归属不明时会报错停止；不会使用 `rmmod -f` 或自动重启宿主机。
+
+仅执行 `bash install.sh --uninstall` 时，不会凭相同版本号推断已加载模块的来源。若模块仍在内存，会先关闭加速并清理本工具规则，随后返回 2，本次不再继续删除文件，也不停止节点；这不表示此前已删除的文件仍然存在。确认要移除当前模块后，可重跑带 `--unload-module` 的命令。若重跑时模块仍被占用、配置文件已不存在，会提示无法确定目标容器并返回 1；请手动停止占用模块的服务后重试。
+
+模块磁盘核验、容器恢复或工具清理失败时，保留源码中的归属标记、已编译的 `brutalctl` 和项目 DKMS 配置，直到后续步骤成功再删除。即使 DKMS 注册已移除，修复故障后重跑也能继续确认辅助文件归属。
+
+只删除 watcher、保留模块供其他工具使用：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/shigalin/brutal-watch/main/install.sh) --uninstall --keep-module
+```
+
+`--keep-module` 同时保留 `brutalctl` 和 DKMS 构建入口，不停止节点容器，不能与 `--unload-module` 混用。`--uninstall` 不能与安装参数混用。
+
+卸载不改动节点 Compose（包括 `GODEBUG=multipathtcp=0`），不删除 Docker、内核 headers、编译器等共享依赖。官方或手工安装、被安装器复用的外部磁盘模块不会冒认成本项目模块删除；DKMS 也可能恢复安装本项目前已有的模块。检测到外部磁盘模块、重新加载的模块或归属不明的 `brutalctl` 等残留时，会明确列出待处理项。
+
+退出码 **0** 表示所选卸载范围完成；**1** 表示失败；**2** 表示仍有待处理项（可能保留整个安装，也可能只剩模块或辅助文件），不能当作完全卸载。输出会说明已完成的步骤和保留内容，可重复执行同一命令核验或继续清理。
 
 ## 开发验证
 
