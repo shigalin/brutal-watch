@@ -69,10 +69,10 @@ main %s
                     self.assertNotIn('runtime-locked', result.stdout)
 
     def test_explicit_configuration_and_enable_order(self):
-        result = self.flow('--configure-node --enable --ports 443')
+        result = self.flow('--configure-node --enable --ports 443 --rate-mbps 200')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('config --ports 443', result.stdout)
-        self.assertIn('validate-config --ports 443', result.stdout)
+        self.assertIn('setup.py config --ports 443 --rate-mbps 200', result.stdout)
+        self.assertIn('validate-config --ports 443 --rate-mbps 200', result.stdout)
         self.assertLess(result.stdout.index('validate-config'), result.stdout.index('prepare'))
         self.assertLess(result.stdout.index('prepare'), result.stdout.index('watch:off'))
         self.assertLess(result.stdout.index('runtime-locked'), result.stdout.index('setup.py config '))
@@ -109,9 +109,10 @@ main %s
                 self.assertNotIn('runtime-locked', result.stdout)
 
     def test_default_node_preflight_receives_install_arguments(self):
-        result = self.flow('--container custom-node --ports 443')
+        result = self.flow('--container custom-node --ports 443 --rate-mbps 200')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('verify-node --container custom-node --ports 443', result.stdout)
+        self.assertIn('verify-node --container custom-node --ports 443 --rate-mbps 200', result.stdout)
+        self.assertIn('setup.py config --container custom-node --ports 443 --rate-mbps 200', result.stdout)
 
     def test_current_version_or_skip_module_needs_no_build_preparation(self):
         for skip, version in ((False, '2.0.1'), (True, '2.0.0')):

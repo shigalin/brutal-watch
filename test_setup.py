@@ -105,7 +105,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertFalse(path.parent.exists())
                 self.assertEqual(setup.write_config(self.args(container='custom-node', ports=[443])), cfg)
 
-    def test_config_preflight_rejects_invalid_or_conflicting_arguments(self):
+    def test_config_preflight_rejects_invalid_arguments_without_writing(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'config.json'
             with patch.object(setup.watch, 'CONFIG', path), patch.object(setup.watch, 'Host') as host:
@@ -116,10 +116,11 @@ class ConfigTests(unittest.TestCase):
                 previous = path.read_bytes()
                 for action in ('validate-config', 'verify-node'):
                     with self.subTest(action=action), \
-                            patch('sys.argv', ['setup.py', action, '--ports', '2053']), \
+                            patch('sys.argv', ['setup.py', action, '--rate-mbps', '0']), \
                             contextlib.redirect_stderr(io.StringIO()):
                         self.assertEqual(setup.main(), 1)
                         self.assertEqual(path.read_bytes(), previous)
+                        self.assertEqual(list(path.parent.glob('config.json.bak.*')), [])
                 host.assert_not_called()
 
     def test_reinstall_preserves_user_settings(self):
@@ -131,8 +132,60 @@ class ConfigTests(unittest.TestCase):
                 cfg = setup.write_config(self.args())
                 self.assertEqual(cfg['ports'], [443])
                 self.assertEqual(path.read_bytes(), previous)
-                with self.assertRaises(ValueError):
-                    setup.write_config(self.args(rate_mbps=100))
+                setup.write_config(self.args(rate_mbps=80, ports=None))
+                self.assertEqual(path.read_bytes(), previous)
+                self.assertEqual(list(path.parent.glob('config.json.bak.*')), [])
+
+    def test_reinstall_updates_only_explicit_settings_and_backs_up(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'config.json'
+            with patch.object(setup.watch, 'CONFIG', path), contextlib.redirect_stdout(io.StringIO()):
+                old = setup.write_config(self.args(container='custom-node', ports=[443], rate_mbps=80,
+                                                   ttl_seconds=1200, max_ips=256))
+                old['exclude_cidrs'] = ['203.0.113.0/24']
+                path.write_text(json.dumps(old, indent=4) + '\n')
+                previous = path.read_bytes()
+                expected = dict(old, rate_mbps=200)
+                cfg = setup.write_config(self.args(rate_mbps=200, ports=None))
+                self.assertEqual(cfg, expected)
+                self.assertEqual(setup.watch.config_load(path), expected)
+                backups = list(path.parent.glob('config.json.bak.*'))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), previous)
+                self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                setup.write_config(self.args(rate_mbps=200))
+                self.assertEqual(list(path.parent.glob('config.json.bak.*')), backups)
+
+    def test_reinstall_preflight_uses_merged_settings_without_writing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'config.json'
+            with patch.object(setup.watch, 'CONFIG', path), patch.object(setup.watch, 'Host') as host, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                old = setup.write_config(self.args(ports=[443], rate_mbps=80, ttl_seconds=1200))
+                previous = path.read_bytes()
+                host.return_value.peers.return_value = set()
+                options = ['--container', 'other-node', '--ports', '2053', '--rate-mbps', '200']
+                for action in ('validate-config', 'verify-node'):
+                    with self.subTest(action=action), patch('sys.argv', ['setup.py', action] + options):
+                        self.assertEqual(setup.main(), 0)
+                        self.assertEqual(path.read_bytes(), previous)
+                        self.assertEqual(list(path.parent.glob('config.json.bak.*')), [])
+                expected = dict(old, container='other-node', ports=[2053], rate_mbps=200)
+                host.return_value.peers.assert_called_once_with(expected)
+                self.assertEqual(setup.write_config(self.args(container='other-node', ports=[2053], rate_mbps=200)), expected)
+
+    def test_failed_backup_leaves_existing_config_untouched(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'config.json'
+            with patch.object(setup.watch, 'CONFIG', path):
+                setup.write_config(self.args(rate_mbps=80))
+                previous = path.read_bytes()
+                with patch.object(setup, 'atomic_text', side_effect=OSError('backup failed')) as write:
+                    with self.assertRaises(OSError):
+                        setup.write_config(self.args(rate_mbps=200))
+                self.assertEqual(write.call_count, 1)
+                self.assertTrue(write.call_args[0][0].name.startswith('config.json.bak.'))
                 self.assertEqual(path.read_bytes(), previous)
 
 

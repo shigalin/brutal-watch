@@ -131,21 +131,20 @@ def ensure_idle():
 
 def write_config(args, dry_run=False):
     path = watch.CONFIG
-    if path.exists():
-        # Reinstallation must not overwrite working user configuration.
-        current = watch.config_load(path)
-        requested = {k: v for k, v in vars(args).items() if k in current and v is not None}
-        if any(current[k] != v for k, v in requested.items()):
-            raise ValueError('现有配置与命令参数不同，请关闭后手动修改 /etc/brutal-watch/config.json；安装器不会覆盖')
-        return current
-    cfg = json.loads((ROOT / 'config.example.json').read_text())
+    current = watch.config_load(path) if path.exists() else None
+    cfg = current.copy() if current is not None else json.loads((ROOT / 'config.example.json').read_text())
+    # Explicit arguments override existing values; omitted options retain them.
     for key in cfg:
         value = getattr(args, key, None)
         if value is not None: cfg[key] = value
     watch.validate_config(cfg)
-    if dry_run:
+    if dry_run or cfg == current:
         return cfg
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if current is not None:
+        backup = path.with_name(path.name + '.bak.' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+        atomic_text(backup, path.read_text())
+        print('原配置已备份：{}'.format(backup))
     atomic_text(path, json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
     return watch.config_load(path)
 
