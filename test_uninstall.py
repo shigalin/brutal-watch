@@ -1,6 +1,8 @@
 import importlib.util
+import json
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -34,6 +36,7 @@ class UninstallTests(unittest.TestCase):
         self.enter(patch.object(uninstall.subprocess, 'check_output', side_effect=self.output))
         self.enter(patch.object(uninstall.subprocess, 'run', side_effect=self.run_command))
         self.enter(patch.object(uninstall.time, 'sleep'))
+        self.enter(patch.object(uninstall, 'node_ready', return_value=123))
         uninstall.COMMAND.write_text('watcher')
         (uninstall.CONFIG / 'config.json').write_text('original configuration')
         for unit in ('brutal-watch.timer', 'brutal-watch.service'):
@@ -53,7 +56,7 @@ class UninstallTests(unittest.TestCase):
         if argv == ['dkms', 'status']:
             return ''.join('tcp-brutal/{}, test-kernel, x86_64: installed\n'.format(v) for v in self.records)
         if argv[:2] == ['docker', 'inspect']:
-            return 'true\n'
+            return 'a' * 64 if argv[3] == '{{.Id}}' else 'true\n'
         self.fail('Unexpected check_output: ' + repr(argv))
 
     def run_command(self, argv, **kwargs):
@@ -200,14 +203,21 @@ class UninstallTests(unittest.TestCase):
             if argv[:2] == ['docker', 'start']:
                 raise subprocess.CalledProcessError(1, argv)
             return original(argv, **kwargs)
-        with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node'}), \
+        with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node', 'ports': [443]}), \
              patch.object(uninstall.subprocess, 'run', side_effect=fail_restore):
             with self.assertRaisesRegex(ValueError, '手动启动'):
                 uninstall.remove(False, unload_loaded=True)
         self.assertEqual(self.records, set())
         for path in (source, override, uninstall.CTL, uninstall.CONFIG, uninstall.COMMAND):
             self.assertTrue(path.exists(), path)
+        receipt = uninstall.STATE / 'uninstall-node.json'
+        self.assertEqual(json.loads(receipt.read_text()),
+                         {'container': 'my-node', 'id': 'a' * 64, 'ports': [443]})
+        self.assertFalse(uninstall.LOADED.exists())
+        self.actions.clear()
         self.assertEqual(uninstall.remove(False, unload_loaded=True), 0)
+        self.assertIn(['docker', 'start', 'a' * 64], self.actions)
+        self.assertFalse(receipt.exists())
         self.assertFalse(source.exists())
         self.assertFalse(uninstall.CTL.exists())
 
@@ -247,7 +257,7 @@ class UninstallTests(unittest.TestCase):
                         raise subprocess.CalledProcessError(1, argv)
                     return self.run_command(argv, **kwargs)
                 clock = iter(range(0, 1000, 10))
-                with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node'}), \
+                with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node', 'ports': [443]}), \
                      patch.object(uninstall.subprocess, 'run', side_effect=busy), \
                      patch.object(uninstall.time, 'monotonic', side_effect=lambda: next(clock)):
                     if failure == 'unload':
@@ -265,10 +275,10 @@ class UninstallTests(unittest.TestCase):
                                 raise subprocess.CalledProcessError(1, ['dkms', 'remove'])
                     else:
                         with uninstall.unload_module():
-                            self.assertNotIn(['docker', 'start', 'my-node'], self.actions)
+                            self.assertNotIn(['docker', 'start', 'a' * 64], self.actions)
                             self.assertFalse(uninstall.LOADED.exists())
-                self.assertIn(['docker', 'stop', '--time', '30', 'my-node'], self.actions)
-                self.assertIn(['docker', 'start', 'my-node'], self.actions)
+                self.assertIn(['docker', 'stop', '--time', '30', 'a' * 64], self.actions)
+                self.assertIn(['docker', 'start', 'a' * 64], self.actions)
                 self.assertNotIn(['rmmod', '-f', 'brutal'], self.actions)
 
     def test_stopped_node_waits_for_unload_and_stays_stopped(self):
@@ -286,7 +296,7 @@ class UninstallTests(unittest.TestCase):
                     shutil.rmtree(uninstall.LOADED)
                     return subprocess.CompletedProcess(argv, 0)
                 clock = iter(range(0, 1000, 10))
-                with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node'}), \
+                with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node', 'ports': [443]}), \
                      patch.object(uninstall.subprocess, 'check_output', return_value='false\n'), \
                      patch.object(uninstall.subprocess, 'run', side_effect=busy), \
                      patch.object(uninstall.time, 'monotonic', side_effect=lambda: next(clock)), \
@@ -311,7 +321,7 @@ class UninstallTests(unittest.TestCase):
     def test_unload_failure_preserves_rmmod_error(self):
         self.load()
         clock = iter(range(0, 1000, 10))
-        with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node'}), \
+        with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node', 'ports': [443]}), \
              patch.object(uninstall.subprocess, 'check_output', return_value='false\n'), \
              patch.object(uninstall.subprocess, 'run', return_value=subprocess.CompletedProcess(
                  ['rmmod', 'brutal'], 1, stderr='rmmod: ERROR: Operation not permitted')) as run, \
@@ -320,6 +330,115 @@ class UninstallTests(unittest.TestCase):
                 with uninstall.unload_module():
                     self.fail('module never unloaded')
             self.assertEqual(run.call_args.kwargs['stderr'], subprocess.PIPE)
+
+    def test_interruption_after_stop_restores_node_and_preserves_installation(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig):
+                self.load()
+                self.actions.clear()
+                def interrupt_stop(argv, **kwargs):
+                    if argv == ['rmmod', 'brutal']:
+                        return subprocess.CompletedProcess(argv, 1, stderr='busy')
+                    if argv[:2] == ['docker', 'stop']:
+                        # Recovery target must be durable before the stop operation begins.
+                        self.assertTrue((uninstall.STATE / 'uninstall-node.json').exists())
+                        signal.raise_signal(sig)
+                    return self.run_command(argv, **kwargs)
+                with patch.object(uninstall.watch, 'config_load', return_value={'container': 'my-node', 'ports': [443]}), \
+                     patch.object(uninstall.subprocess, 'run', side_effect=interrupt_stop), \
+                     patch.object(uninstall.sys, 'argv', ['uninstall.py', 'remove', '--unload-module']):
+                    self.assertEqual(uninstall.main(), 130)
+                self.assertIn(['docker', 'start', 'a' * 64], self.actions)
+                self.assertTrue(uninstall.COMMAND.exists())
+                self.assertTrue(uninstall.LOADED.exists())
+                self.assertFalse((uninstall.STATE / 'uninstall-node.json').exists())
+
+
+class NodeRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.record = {'container': 'my-node', 'id': 'a' * 64, 'ports': [443]}
+        self.receipt = self.root / 'uninstall-node.json'
+        self.receipt.write_text(json.dumps(self.record))
+        patcher = patch.object(uninstall, 'STATE', self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_retry_restores_recorded_container_even_without_module(self):
+        with patch.object(uninstall, 'start_node') as start:
+            uninstall.recover_node()
+        start.assert_called_once_with(self.record)
+        self.assertFalse(self.receipt.exists())
+
+    def test_failed_recovery_keeps_receipt(self):
+        with patch.object(uninstall, 'start_node', side_effect=ValueError('not listening')):
+            with self.assertRaisesRegex(ValueError, 'not listening'):
+                uninstall.recover_node()
+        self.assertEqual(json.loads(self.receipt.read_text()), self.record)
+
+    def test_running_container_without_ports_is_not_recovered(self):
+        # The container exists and Docker accepts start, but the node never listens.
+        with patch.object(uninstall.subprocess, 'run'), \
+             patch.object(uninstall.subprocess, 'check_output', return_value='true\n'), \
+             patch.object(uninstall, 'node_ready', create=True, side_effect=ValueError('missing port 443')), \
+             patch.object(uninstall.time, 'monotonic', side_effect=range(0, 1000, 10)), \
+             patch.object(uninstall.time, 'sleep'):
+            with self.assertRaisesRegex(ValueError, '443'):
+                uninstall.start_node(self.record)
+
+    def test_recovery_waits_for_stable_listeners(self):
+        with patch.object(uninstall.subprocess, 'run') as run, \
+             patch.object(uninstall.subprocess, 'check_output', return_value='true\n'), \
+             patch.object(uninstall, 'node_ready', create=True,
+                          side_effect=[ValueError('starting'), 123, 123, 124, 124, 124]) as ready, \
+             patch.object(uninstall.time, 'sleep'):
+            uninstall.start_node(self.record)
+        self.assertEqual(ready.call_count, 6)
+        self.assertEqual(run.call_args.args[0], ['docker', 'start', self.record['id']])
+
+    def test_invalid_receipt_never_starts_container(self):
+        self.receipt.write_text(json.dumps(dict(self.record, id='my-node')))
+        with patch.object(uninstall.subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, '恢复记录损坏'):
+                uninstall.recover_node()
+        run.assert_not_called()
+        self.assertTrue(self.receipt.exists())
+
+    def test_listener_must_belong_to_recorded_container_process(self):
+        proc = self.root / 'proc'
+        process = proc / '123'
+        (process / 'fd').mkdir(parents=True)
+        (process / 'net').mkdir()
+        (process / 'fd/5').symlink_to('socket:[100]')
+        table = process / 'net/tcp'
+        header = 'sl local_address rem_address st tx_queue rx_queue tr tm_when retrnsmt uid timeout inode\n'
+        with patch.object(uninstall.watch, 'PROC', proc), \
+             patch.object(uninstall.subprocess, 'check_output', return_value='123 true\n'):
+            for inode, state, port, ready in (('999', '0A', '01BB', False),
+                                             ('100', '01', '01BB', False),
+                                             ('100', '0A', '0050', False),
+                                             ('100', '0A', '01BB', True)):
+                with self.subTest(inode=inode, state=state, port=port):
+                    table.write_text(header + '0: 00000000:{} 00000000:0000 {} 0:0 0:0 0 0 0 {}\n'.format(
+                        port, state, inode))
+                    if ready:
+                        self.assertEqual(uninstall.node_ready(self.record), 123)
+                    else:
+                        with self.assertRaises(uninstall.watch.WatchError):
+                            uninstall.node_ready(self.record)
+
+    def test_second_interrupt_does_not_abort_recovery(self):
+        def restoring(record):
+            signal.raise_signal(signal.SIGTERM)
+            signal.raise_signal(signal.SIGINT)
+        handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+        with patch.object(uninstall, 'start_node', side_effect=restoring):
+            uninstall.recover_node()
+        self.assertFalse(self.receipt.exists())
+        for sig, handler in handlers.items():
+            self.assertEqual(signal.getsignal(sig), handler)
 
 
 class UninstallEntryTests(unittest.TestCase):
@@ -340,7 +459,7 @@ main --uninstall --unload-module
         self.assertIn('uninstall.py remove --unload-module', result.stdout)
 
     def test_real_uninstall_sequence_and_failure_exit_codes(self):
-        for failure, expected in (('', 0), ('preflight', 1), ('off', 1), ('remove', 2)):
+        for failure, expected in (('', 0), ('recover-node', 1), ('preflight', 1), ('off', 1), ('remove', 2)):
             with self.subTest(failure=failure):
                 script = '''source "$1/install.sh"
 mock_failure=$2
@@ -364,14 +483,21 @@ main --uninstall --keep-module
                 result = subprocess.run(['bash', '-c', script, 'test', str(ROOT), failure], capture_output=True, text=True)
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertNotIn('unexpected', result.stdout)
-                if failure in ('off', 'preflight'):
-                    self.assertNotIn('runtime-lock', result.stdout)
+                self.assertLess(result.stdout.index('install-lock'), result.stdout.index('runtime-lock'))
+                self.assertLess(result.stdout.index('runtime-lock'), result.stdout.index('uninstall.py recover-node'))
+                if failure == 'recover-node':
+                    self.assertNotIn('uninstall.py preflight', result.stdout)
+                    self.assertNotIn('\noff', result.stdout)
+                    self.assertNotIn('uninstall.py remove', result.stdout)
+                elif failure in ('off', 'preflight'):
+                    self.assertEqual(result.stdout.count('runtime-lock'), 1)
                     self.assertNotIn('uninstall.py remove', result.stdout)
                 else:
+                    self.assertLess(result.stdout.index('uninstall.py recover-node'), result.stdout.index('uninstall.py preflight'))
                     self.assertLess(result.stdout.index('install-lock'), result.stdout.index('uninstall.py preflight'))
                     self.assertLess(result.stdout.index('uninstall.py preflight'), result.stdout.index('\noff'))
-                    self.assertLess(result.stdout.index('\noff'), result.stdout.index('runtime-lock'))
-                    self.assertLess(result.stdout.index('runtime-lock'), result.stdout.index('uninstall.py remove --keep-module'))
+                    self.assertLess(result.stdout.index('\noff'), result.stdout.rindex('runtime-lock'))
+                    self.assertLess(result.stdout.rindex('runtime-lock'), result.stdout.index('uninstall.py remove --keep-module'))
 
     def test_uninstall_branch_bypasses_installation_and_preserves_order(self):
         script = '''source "$1/install.sh"

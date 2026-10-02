@@ -455,6 +455,10 @@ uninstall_main() {
   local options=()
   [[ "$KEEP_MODULE" == 0 ]] || options+=(--keep-module)
   [[ "$UNLOAD_MODULE" == 0 ]] || options+=(--unload-module)
+  # Recover a node stopped by an interrupted uninstall before any new preflight can fail.
+  acquire_runtime_lock
+  python3 "$SOURCE_DIR/scripts/uninstall.py" recover-node
+  release_runtime_lock
   python3 "$SOURCE_DIR/scripts/uninstall.py" preflight ${options[@]+"${options[@]}"}
   stop_existing_watch
   acquire_runtime_lock

@@ -4,9 +4,12 @@ import argparse
 import contextlib
 import filecmp
 import importlib.util
+import json
+import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -27,6 +30,7 @@ CTL = Path('/usr/local/bin/brutalctl')
 LOADED = Path('/sys/module/brutal')
 MANAGED_HEADER = '# Managed by brutal-watch'
 UNLOAD_WAIT_SECONDS = 60
+START_WAIT_SECONDS = 60
 
 
 def run(argv):
@@ -108,14 +112,85 @@ def try_unload():
     return not LOADED.exists(), error or 'rmmod 退出码 {}，模块仍在内存中'.format(result.returncode)
 
 
-def start_node(container):
+def node_ready(record):
+    container = record['id']
+    fmt = '{{.State.Pid}} {{.State.Running}}'
+    info = subprocess.check_output(['docker', 'inspect', '-f', fmt, container], text=True, timeout=5).split()
+    if len(info) != 2 or info[1] != 'true' or not info[0].isdigit() or int(info[0]) < 1:
+        raise ValueError('容器尚未运行')
+    root = watch.PROC / info[0]
+    inodes = set()
+    for fd in (root / 'fd').iterdir():
+        try:
+            target = os.readlink(fd)
+        except FileNotFoundError:
+            continue
+        match = re.fullmatch(r'socket:\[(\d+)\]', target)
+        if match:
+            inodes.add(match[1])
+    tables = [(root / 'net/tcp').read_text()]
+    if (root / 'net/tcp6').exists():
+        tables.append((root / 'net/tcp6').read_text())
+    watch.proc_peers(tables, inodes, record['ports'], [])
+    if subprocess.check_output(['docker', 'inspect', '-f', fmt, container], text=True, timeout=5).split() != info:
+        raise ValueError('检查监听时容器发生变化')
+    return int(info[0])
+
+
+def start_node(record):
     try:
-        run(['docker', 'start', container])
-        running = subprocess.check_output(['docker', 'inspect', '-f', '{{.State.Running}}', container], text=True)
+        subprocess.run(['docker', 'start', record['id']], check=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError('节点容器恢复失败，请手动启动并检查日志：{}（{}）'.format(container, watch.short_error(exc))) from exc
-    if running.strip() != 'true':
-        raise ValueError('节点容器未恢复运行，请手动启动并检查日志：' + container)
+        raise ValueError('节点容器恢复失败，请手动启动并检查日志：{}（{}）'.format(
+            record['container'], watch.short_error(exc))) from exc
+    deadline = time.monotonic() + START_WAIT_SECONDS
+    previous_pid, stable = None, 0
+    error = '等待节点监听'
+    while True:
+        try:
+            pid = node_ready(record)
+            stable = stable + 1 if pid == previous_pid else 1
+            previous_pid = pid
+            error = '容器进程及配置端口尚未连续通过 3 次检查'
+            if stable >= 3:
+                print('节点容器及配置 TCP 端口已恢复：' + record['container'], flush=True)
+                return
+        except (OSError, ValueError, watch.WatchError, subprocess.SubprocessError) as exc:
+            stable, previous_pid = 0, None
+            error = watch.short_error(exc)
+        if time.monotonic() >= deadline:
+            raise ValueError('节点恢复检查超时，请手动启动并检查日志：{}；端口 {}；{}'.format(
+                record['container'], record['ports'], error))
+        time.sleep(1)
+
+
+def recover_node():
+    path = STATE / 'uninstall-node.json'
+    plain_path(STATE, directory=True)
+    plain_path(path)
+    if not path.exists():
+        return
+    record = json.loads(path.read_text())
+    if (not isinstance(record, dict) or set(record) != {'container', 'id', 'ports'}
+            or not isinstance(record['container'], str)
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', record['container'])
+            or not isinstance(record['id'], str) or not re.fullmatch(r'[0-9a-f]{64}', record['id'])
+            or not isinstance(record['ports'], list) or not record['ports']
+            or any(type(p) is not int or not 1 <= p <= 65535 for p in record['ports'])):
+        raise ValueError('节点恢复记录损坏，保留文件，请人工核查：' + str(path))
+    # Do not let a second Ctrl+C/TERM interrupt restoration after stopping a node.
+    handlers = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        start_node(record)
+        path.unlink()
+        directory = os.open(str(STATE), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
 
 @contextlib.contextmanager
@@ -141,12 +216,20 @@ def unload_module():
         raise ValueError('无法确认目标节点运行状态，保留节点及模块。rmmod：' + error)
     was_running = result.strip() == 'true'
     if was_running:
+        container_id = subprocess.check_output(['docker', 'inspect', '-f', '{{.Id}}', container], text=True).strip()
+        if not re.fullmatch(r'[0-9a-f]{64}', container_id):
+            raise ValueError('无法确认目标容器 ID，尚未停止节点')
+        record = {'container': container, 'id': container_id, 'ports': cfg['ports']}
+    if was_running:
         print('模块未能卸载，停止节点容器并中断现有连接：' + container, flush=True)
     else:
         print('目标节点已停止，等待模块释放并重试卸载：' + container, flush=True)
+    original_error = None
     try:
         if was_running:
-            run(['docker', 'stop', '--time', '30', container])
+            # Persist before stop: a killed installer or reboot must not lose the recovery target.
+            watch.Store(STATE / 'uninstall-node.json').save(record)
+            subprocess.run(['docker', 'stop', '--time', '30', container_id], check=True, timeout=40)
         # Orphaned connections keep the congestion module referenced until they finish closing.
         deadline = time.monotonic() + UNLOAD_WAIT_SECONDS
         while True:
@@ -159,15 +242,17 @@ def unload_module():
             time.sleep(1)
         yield  # Keep the node stopped until DKMS files are removed too.
     except BaseException as exc:
-        # Restore the node even when stop/unload fails after partially succeeding.
+        original_error = exc
+        raise
+    finally:
+        # Restore even when stop/unload fails or the installer is interrupted.
         if was_running:
             try:
-                start_node(container)
-            except ValueError as restore_error:
-                raise ValueError(watch.short_error(exc) + '；' + str(restore_error)) from exc
-        raise
-    if was_running:
-        start_node(container)
+                recover_node()
+            except (OSError, ValueError, watch.WatchError, subprocess.SubprocessError) as restore_error:
+                if original_error is not None:
+                    raise ValueError(watch.short_error(original_error) + '；' + str(restore_error)) from original_error
+                raise
 
 
 def ensure_idle():
@@ -186,6 +271,7 @@ def ensure_idle():
 
 
 def remove(keep_module, unload_loaded=False):
+    recover_node()  # Also needed when a previous attempt already removed the module.
     plan = preflight(keep_module)  # Recheck after stopping and taking the runtime lock.
     ensure_idle()
     warnings = []
@@ -281,20 +367,32 @@ def remove(keep_module, unload_loaded=False):
 def main():
     watch.configure_output()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('preflight', 'remove'))
+    parser.add_argument('action', choices=('preflight', 'remove', 'recover-node'))
     parser.add_argument('--keep-module', action='store_true')
     parser.add_argument('--unload-module', action='store_true', help='允许卸载当前已加载的 brutal 模块，包括外部安装的模块')
     args = parser.parse_args()
     if args.keep_module and args.unload_module:
         parser.error('--keep-module 不能与 --unload-module 一起使用')
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+    handlers = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
+        if args.action == 'recover-node':
+            recover_node()
+            return 0
         if args.action == 'preflight':
             preflight(args.keep_module)
             return 0
         return remove(args.keep_module, args.unload_module)
+    except KeyboardInterrupt:
+        print('卸载已中断；已尝试恢复本工具停止的节点，未完成的恢复记录会保留供重试。', file=sys.stderr)
+        return 130
     except (OSError, ValueError, watch.WatchError, subprocess.SubprocessError) as exc:
         print('卸载失败：' + watch.short_error(exc), file=sys.stderr)
         return 1
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == '__main__':
