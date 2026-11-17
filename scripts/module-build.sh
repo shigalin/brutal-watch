@@ -58,11 +58,11 @@ build_module() {
   selected=$(choose_compiler "$headers" "$policy")
   if [[ "$selected" == native:llvm ]]; then
     # Upstream detects CONFIG_CC_IS_CLANG and supplies LLVM=1 to Kbuild.
-    exec make -j2 KERNEL_DIR="$headers" all
+    exec make -j1 KERNEL_DIR="$headers" all
   fi
   if [[ "$selected" == native:* ]]; then
     compiler=${selected#native:}
-    exec make -j2 KERNEL_DIR="$headers" CC="$compiler" all
+    exec make -j1 KERNEL_DIR="$headers" CC="$compiler" all
   fi
   major=${selected#docker:}
   image=$(compiler_image "$major")

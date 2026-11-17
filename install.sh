@@ -362,7 +362,7 @@ install_module() {
 MAKE[0]="$LIBEXEC/module-build $COMPILER \${kernel_source_dir}"
 EOF
   dkms status -m "$MODULE_NAME" -v "$DKMS_VERSION" | grep -q . || dkms add -m "$MODULE_NAME" -v "$DKMS_VERSION"
-  dkms build -m "$MODULE_NAME" -v "$DKMS_VERSION" -k "$kernel" -j 2
+  dkms build -m "$MODULE_NAME" -v "$DKMS_VERSION" -k "$kernel" -j 1
   make -C "$source/tools"
   dkms install -m "$MODULE_NAME" -v "$DKMS_VERSION" -k "$kernel"
   install -m 755 "$source/tools/brutalctl" /usr/local/bin/brutalctl
